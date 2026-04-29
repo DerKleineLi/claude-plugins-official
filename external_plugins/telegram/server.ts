@@ -16,7 +16,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
+import { Bot, GrammyError, InlineKeyboard, InputFile, API_CONSTANTS, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
@@ -397,7 +397,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. If the tag has a reply_to_message_id attribute, the sender used Telegram\'s reply gesture on a prior message — use reply_to_message_id (and the optional reply_to_text snippet) to know which thread they\'re responding to. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. If the tag has a reply_to_message_id attribute, the sender used Telegram\'s reply gesture on a prior message — use reply_to_message_id (and the optional reply_to_text snippet) to know which thread they\'re responding to. If the tag has a reaction attribute, the sender added or changed an emoji reaction on the message identified by message_id; typically just acknowledge it silently and don\'t auto-reply unless context warrants a response. A reaction_removed attribute means a previously-set emoji was cleared. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -882,6 +882,67 @@ bot.on('message:sticker', async ctx => {
   })
 })
 
+// Emoji-reaction updates. Telegram delivers these only when allowed_updates
+// includes 'message_reaction' AND (in groups) the bot is an admin. DM
+// behaviour is documented inconsistently — empirical test required.
+//
+// We diff old vs new reaction lists to decide whether the user added or
+// cleared an emoji. v1: emit a notification regardless of add/remove and
+// let the agent decide what to do. The system-prompt instructions tell it
+// to typically acknowledge silently.
+bot.on('message_reaction', async ctx => {
+  const result = gate(ctx)
+  if (result.action !== 'deliver') return
+
+  const r = ctx.messageReaction
+  if (!r) return
+  const from = ctx.from
+  if (!from) return
+
+  // Stringify a single ReactionType. Plain emoji passes through; custom and
+  // paid variants stringify to placeholders so the agent can recognise the
+  // shape without needing the raw object.
+  const stringify = (rt: { type: string; emoji?: string; custom_emoji_id?: string }): string => {
+    if (rt.type === 'emoji' && rt.emoji) return rt.emoji
+    if (rt.type === 'custom_emoji' && rt.custom_emoji_id) return `<custom_emoji:${rt.custom_emoji_id}>`
+    if (rt.type === 'paid') return '<paid_reaction>'
+    return `<${rt.type}>`
+  }
+
+  const oldList = (r.old_reaction ?? []).map(stringify)
+  const newList = (r.new_reaction ?? []).map(stringify)
+
+  // First emoji in the new reaction list — what the user is currently
+  // reacting with. Empty if they just cleared their reaction.
+  const reaction = newList[0]
+  // If the user previously had a reaction that's no longer in the new list,
+  // record the first removed emoji so the agent can distinguish add vs clear.
+  const removed = oldList.find(e => !newList.includes(e))
+
+  const chat_id = String(ctx.chat!.id)
+  // ctx.messageReaction.message_id is the TARGET message — the one being
+  // reacted to, NOT a fresh message from the user.
+  const message_id = String(r.message_id)
+
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: reaction ? `<reacted with ${reaction}>` : '<cleared reaction>',
+      meta: {
+        chat_id,
+        message_id,
+        user: from.username ?? String(from.id),
+        user_id: String(from.id),
+        ts: new Date((r.date ?? 0) * 1000).toISOString(),
+        ...(reaction ? { reaction } : {}),
+        ...(removed ? { reaction_removed: removed } : {}),
+      },
+    },
+  }).catch(err => {
+    process.stderr.write(`telegram channel: reaction notification failed: ${err}\n`)
+  })
+})
+
 type AttachmentMeta = {
   kind: string
   file_id: string
@@ -1006,6 +1067,12 @@ void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
+        // message_reaction (and several other update types) are NOT delivered
+        // by default — Telegram requires opt-in via allowed_updates. Pass the
+        // grammy-shipped ALL_UPDATE_TYPES constant so we get every kind the
+        // current grammy version knows about, without manually maintaining
+        // the list. New update types arrive automatically on grammy upgrades.
+        allowed_updates: API_CONSTANTS.ALL_UPDATE_TYPES,
         onStart: info => {
           attempt = 0
           botUsername = info.username
