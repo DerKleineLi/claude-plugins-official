@@ -43,11 +43,12 @@ Arguments passed: `$ARGUMENTS`
       "createdAt": <ms>, "expiresAt": <ms>
     }
   },
-  "mentionPatterns": ["@mybot"]
+  "mentionPatterns": ["@mybot"],
+  "mgmtEnabled": false
 }
 ```
 
-Missing file = `{dmPolicy:"pairing", allowFrom:[], groups:{}, pending:{}}`.
+Missing file = `{dmPolicy:"pairing", allowFrom:[], groups:{}, pending:{}}`. Missing `mgmtEnabled` = `false` (server-management tools refuse to run).
 
 ---
 
@@ -59,7 +60,7 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 
 1. Read `~/.claude/channels/discord/access.json` (handle missing file).
 2. Show: dmPolicy, allowFrom count and list, pending count with codes +
-   sender IDs + age, groups count.
+   sender IDs + age, groups count, mgmtEnabled value (default false).
 
 ### `pair <code>`
 
@@ -105,6 +106,21 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 ### `group rm <channelId>`
 
 1. Read, `delete groups[<channelId>]`, write.
+
+### `mgmt <on|off>`
+
+Gate server-management tools (`create_channel`, `delete_channel`,
+`modify_channel`, `create_thread`, `start_forum_post`,
+`bulk_delete_messages`, `pin_message`, `unpin_message`, `get_audit_log`).
+Off by default; the bot also needs Manage Channels / Manage Threads /
+Manage Messages / View Audit Log granted in the Dev Portal for the tools
+to actually work once enabled.
+
+1. Validate `<on>` is one of `on`, `off`.
+2. Read `~/.claude/channels/discord/access.json` (create default if missing).
+3. Set `mgmtEnabled` to `true` (on) or `false` (off).
+4. Write back.
+5. Confirm: "management is now enabled" / "management is now disabled".
 
 ### `set <key> <value>`
 

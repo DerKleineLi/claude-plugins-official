@@ -101,6 +101,8 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
 | `/discord:access policy allowlist` | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`. |
 | `/discord:access group add 846209781206941736` | Enable a guild channel. Flags: `--no-mention`, `--allow id1,id2`. |
 | `/discord:access group rm 846209781206941736` | Disable a guild channel. |
+| `/discord:access mgmt on` | Enable server-management tools (`create_channel`, `delete_channel`, `modify_channel`, `create_thread`, `start_forum_post`, `bulk_delete_messages`, `pin_message`, `unpin_message`, `get_audit_log`). Bot must also have the matching permissions granted in the Dev Portal. Off by default. |
+| `/discord:access mgmt off` | Disable management tools — they will refuse to run until re-enabled. |
 | `/discord:access set ackReaction 🔨` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`. |
 
 ## Config file
