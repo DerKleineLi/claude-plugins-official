@@ -458,6 +458,47 @@ function parseChannelType(name: string): ChannelType {
   return t
 }
 
+// Pull JSON-serialisable channel metadata for inspection. Each subclass
+// (TextChannel, ThreadChannel, ForumChannel, ...) exposes a different
+// subset of fields, so we use `in` checks rather than instanceof to
+// avoid importing every subclass type. ChannelType[num] reverse-maps the
+// numeric enum to its string label (e.g. 15 → "GuildForum").
+function channelStateJson(ch: any): Record<string, unknown> {
+  const typeNum = ch.type as number
+  const out: Record<string, unknown> = {
+    id: ch.id,
+    name: ch.name ?? null,
+    type: typeNum,
+    type_name: ChannelType[typeNum] ?? null,
+  }
+  if ('parentId' in ch) out.parent_id = ch.parentId ?? null
+  if ('position' in ch) out.position = ch.position ?? null
+  if ('topic' in ch) out.topic = ch.topic ?? null
+  if ('rateLimitPerUser' in ch) out.rate_limit_per_user = ch.rateLimitPerUser ?? null
+  if ('nsfw' in ch) out.nsfw = ch.nsfw ?? null
+  if ('archived' in ch) out.archived = ch.archived ?? null
+  if ('locked' in ch) out.locked = ch.locked ?? null
+  if ('autoArchiveDuration' in ch) out.auto_archive_duration = ch.autoArchiveDuration ?? null
+  if ('messageCount' in ch) out.message_count = ch.messageCount ?? null
+  if ('memberCount' in ch) out.member_count = ch.memberCount ?? null
+  if ('appliedTags' in ch) out.applied_tags = ch.appliedTags ?? []
+  // ForumChannel-specific. GuildForumTag = {id, name, emoji: {id, name}|null, moderated}.
+  // Note: emoji uses {id, name}, NOT {emojiId, emojiName} — the latter is the
+  // edit-input shape only.
+  if ('availableTags' in ch) {
+    out.available_tags = (ch.availableTags as Array<{ id: string; name: string; emoji: { id: string | null; name: string | null } | null; moderated: boolean }>).map(t => ({
+      id: t.id,
+      name: t.name,
+      emoji: t.emoji,
+      moderated: t.moderated,
+    }))
+  }
+  if ('defaultReactionEmoji' in ch) out.default_reaction_emoji = ch.defaultReactionEmoji ?? null
+  if ('defaultSortOrder' in ch) out.default_sort_order = ch.defaultSortOrder ?? null
+  if ('defaultAutoArchiveDuration' in ch) out.default_auto_archive_duration = ch.defaultAutoArchiveDuration ?? null
+  return out
+}
+
 // Stringify a MessageReaction.emoji for the inbound notification.
 // Unicode emoji → just the char (e.g. "👍"). Custom emoji → the
 // `<:name:id>` / `<a:name:id>` form so the agent can recognise it
@@ -700,7 +741,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'modify_channel',
       description:
-        'Edit a channel or thread (rename, change topic, slowmode, forum tags, archive/lock). (requires mgmtEnabled in access.json — turn on with /discord:access mgmt on)',
+        "Edit a channel or thread (rename, change topic, slowmode, forum tags, archive/lock). On success, returns the channel's full updated state as JSON — so newly-created available_tags surface their server-assigned IDs without a follow-up get_channel call. (requires mgmtEnabled in access.json — turn on with /discord:access mgmt on)",
       inputSchema: {
         type: 'object',
         properties: {
@@ -798,6 +839,18 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           reason: { type: 'string' },
         },
         required: ['chat_id', 'message_id'],
+      },
+    },
+    {
+      name: 'get_channel',
+      description:
+        "Fetch a channel's metadata as JSON: id, name, type (numeric + type_name like 'GuildForum'), parent_id, position, topic, rate_limit_per_user, nsfw, archived, locked, auto_archive_duration, message_count, member_count, applied_tags. For forum channels also returns available_tags (each {id, name, emoji: {id, name}|null, moderated}), default_reaction_emoji, default_sort_order, default_auto_archive_duration. Read-only — use after creating forum tags to retrieve their assigned IDs. (requires mgmtEnabled in access.json — turn on with /discord:access mgmt on)",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          channel_id: { type: 'string' },
+        },
+        required: ['channel_id'],
       },
     },
     {
@@ -965,7 +1018,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         if (args.locked != null) payload.locked = args.locked
         if (args.reason != null) payload.reason = args.reason
         const edited = await (ch as any).edit(payload)
-        return { content: [{ type: 'text', text: `modified channel ${edited.id}` }] }
+        // edit() resolves with the same channel instance, _patch'd with the
+        // Discord API response — so newly-created availableTags carry their
+        // server-assigned IDs. Surface the full state so the parent doesn't
+        // need a follow-up get_channel.
+        const state = channelStateJson(edited)
+        return {
+          content: [{ type: 'text', text: `modified channel ${edited.id}\n\n${JSON.stringify(state, null, 2)}` }],
+        }
       }
       case 'create_thread': {
         assertMgmtEnabled()
@@ -1051,6 +1111,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const msg = await ch.messages.fetch(args.message_id as string)
         await msg.unpin(args.reason as string | undefined)
         return { content: [{ type: 'text', text: `unpinned message ${msg.id}` }] }
+      }
+      case 'get_channel': {
+        assertMgmtEnabled()
+        const channel_id = args.channel_id as string
+        const ch = await client.channels.fetch(channel_id)
+        if (!ch) throw new Error(`channel ${channel_id} not found`)
+        return {
+          content: [{ type: 'text', text: JSON.stringify(channelStateJson(ch), null, 2) }],
+        }
       }
       case 'get_audit_log': {
         assertMgmtEnabled()

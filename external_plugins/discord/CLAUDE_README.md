@@ -22,6 +22,7 @@ This unification (bare MCP server + `--plugin-dir`, no marketplace) was settled 
 - **2026-05-08** — Phase 1 server-management tools (`create_channel`, `delete_channel`, `modify_channel`, `create_thread`, `start_forum_post`, `bulk_delete_messages`, `pin_message`, `unpin_message`, `get_audit_log`), gated on `mgmtEnabled` in `access.json`.
 - **2026-05-08** — Forward `reply_to_message_id` (and `reply_to_user`/`reply_to_user_id`/`reply_to_text`) on inbound channel blocks. Parity with telegram fork commit `bfeb345`.
 - **2026-05-08** — Forward emoji reactions (`messageReactionAdd`/`Remove` → `<channel … reaction="…">` block). Parity with telegram fork commit `c90b380`.
+- **2026-05-08** — Channel inspection: `get_channel` (read-only) returns full metadata as JSON, including forum `available_tags` with their server-assigned IDs. `modify_channel` now also returns the full updated state in its response, so creating a tag and applying it to a post is a 2-call sequence (modify → start_forum_post with `applied_tags`) instead of 3 (modify → get → start_forum_post).
 
 ## Architecture rationale
 
@@ -53,6 +54,18 @@ Privileged Gateway Intents in use:
 - **Do not** add per-channel permission gates for management ops. The right gate is the single `mgmtEnabled` boolean. A "create_channel only in allowlisted parent" check would be incoherent (the channel doesn't exist yet) and adds no real safety on a single-user server.
 - **Do not** add an Administrator-permission shortcut. The user explicitly rejected this; least-privilege is non-negotiable.
 - **Do not** modify `~/.claude/clive_channels.json` to point at a different path. The plugin path is load-bearing for `--plugin-dir`.
+
+## Tool reference (mgmt-gated)
+
+`channel/thread/forum CRUD`: `create_channel`, `delete_channel`, `modify_channel`, `create_thread`, `start_forum_post`. **`modify_channel` returns the full updated channel state as JSON** — use this to discover server-assigned IDs after creating new `available_tags`.
+
+`bulk message ops`: `bulk_delete_messages` (≤100, ≤14 days), `pin_message`, `unpin_message`.
+
+`inspection`: `get_channel` (read-only metadata for any channel, including forum `available_tags` with IDs), `get_audit_log` (filter by user/action/before).
+
+The 2-call "create-then-apply" pattern for forum tags:
+1. `modify_channel` with `available_tags: [{name: "bug"}]` — response carries the new tag's `id`.
+2. `start_forum_post` with `applied_tags: ["<id from step 1>"]`.
 
 ## How to extend
 
