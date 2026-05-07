@@ -30,6 +30,10 @@ import {
   type Message,
   type Attachment,
   type Interaction,
+  type MessageReaction,
+  type PartialMessageReaction,
+  type User,
+  type PartialUser,
 } from 'discord.js'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
@@ -86,9 +90,14 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    // Reaction events on guild + DM messages.
+    GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.DirectMessageReactions,
   ],
   // DMs arrive as partial channels — messageCreate never fires without this.
-  partials: [Partials.Channel],
+  // Partials.Message/Reaction/User let messageReactionAdd fire on uncached
+  // messages (e.g., older messages the gateway didn't see come up).
+  partials: [Partials.Channel, Partials.Message, Partials.Reaction, Partials.User],
 })
 
 type PendingEntry = {
@@ -449,6 +458,15 @@ function parseChannelType(name: string): ChannelType {
   return t
 }
 
+// Stringify a MessageReaction.emoji for the inbound notification.
+// Unicode emoji → just the char (e.g. "👍"). Custom emoji → the
+// `<:name:id>` / `<a:name:id>` form so the agent can recognise it
+// (and re-react to it via the existing react tool).
+function emojiToString(emoji: { id: string | null; name: string | null; animated?: boolean | null }): string {
+  if (!emoji.id) return emoji.name ?? '<unknown>'
+  return `<${emoji.animated ? 'a' : ''}:${emoji.name ?? '_'}:${emoji.id}>`
+}
+
 async function downloadAttachment(att: Attachment): Promise<string> {
   if (att.size > MAX_ATTACHMENT_BYTES) {
     throw new Error(`attachment too large: ${(att.size / 1024 / 1024).toFixed(1)}MB, max ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB`)
@@ -492,6 +510,8 @@ const mcp = new Server(
       'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
       "If the tag has a reply_to_message_id attribute, the sender used Discord's reply gesture on a prior message — use reply_to_message_id (and the optional reply_to_text snippet) to know which thread they're responding to.",
+      '',
+      "If the tag has a reaction attribute, the sender added or changed an emoji reaction on the message identified by message_id; typically just acknowledge it silently and don't auto-reply unless context warrants a response. A reaction_removed attribute means a previously-set emoji was cleared.",
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -1155,6 +1175,79 @@ client.on('messageCreate', msg => {
   if (msg.author.bot) return
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
 })
+
+// Reaction events — emitted when a user adds or removes an emoji on a
+// message in an allowlisted DM/channel. Mirrors the telegram parity patch.
+// The system-prompt instructions tell the agent to typically acknowledge
+// silently; we forward the event and let it decide.
+client.on('messageReactionAdd', (reaction, user) => {
+  handleReaction(reaction, user, false).catch(e =>
+    process.stderr.write(`discord: handleReaction(add) failed: ${e}\n`),
+  )
+})
+client.on('messageReactionRemove', (reaction, user) => {
+  handleReaction(reaction, user, true).catch(e =>
+    process.stderr.write(`discord: handleReaction(remove) failed: ${e}\n`),
+  )
+})
+
+async function handleReaction(
+  reaction: MessageReaction | PartialMessageReaction,
+  user: User | PartialUser,
+  removed: boolean,
+): Promise<void> {
+  // Skip the bot's own reactions (ack reactions, perm-reply confirms, etc).
+  if (user.id === client.user?.id) return
+
+  // Resolve partials — uncached older messages arrive partial. If fetching
+  // fails (deleted, missing perms), bail rather than emit a half-empty event.
+  if (reaction.partial) {
+    try { await reaction.fetch() } catch { return }
+  }
+  if (reaction.message.partial) {
+    try { await reaction.message.fetch() } catch { return }
+  }
+  if (user.partial) {
+    try { await user.fetch() } catch { return }
+  }
+
+  // Gate — same shape as the chat gate, but reactions never @mention so we
+  // skip the requireMention check. DM gating uses allowFrom; guild channels
+  // use the per-channel groups entry.
+  const access = loadAccess()
+  if (access.dmPolicy === 'disabled') return
+
+  const channel = reaction.message.channel
+  const chat_id = channel.id
+  if (channel.type === ChannelType.DM) {
+    if (!access.allowFrom.includes(user.id)) return
+  } else {
+    const channelKey = channel.isThread() ? channel.parentId ?? chat_id : chat_id
+    const policy = access.groups[channelKey]
+    if (!policy) return
+    if (policy.allowFrom?.length > 0 && !policy.allowFrom.includes(user.id)) return
+  }
+
+  const emoji = emojiToString(reaction.emoji)
+  const username = ('username' in user && user.username) ? user.username : user.id
+
+  void mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: removed ? `<cleared reaction ${emoji}>` : `<reacted with ${emoji}>`,
+      meta: {
+        chat_id,
+        message_id: reaction.message.id,
+        user: username,
+        user_id: user.id,
+        ts: new Date().toISOString(),
+        ...(removed ? { reaction_removed: emoji } : { reaction: emoji }),
+      },
+    },
+  }).catch(err => {
+    process.stderr.write(`discord channel: reaction notification failed: ${err}\n`)
+  })
+}
 
 async function handleInbound(msg: Message): Promise<void> {
   const result = await gate(msg)
