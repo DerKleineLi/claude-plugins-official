@@ -491,6 +491,8 @@ const mcp = new Server(
       '',
       'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
+      "If the tag has a reply_to_message_id attribute, the sender used Discord's reply gesture on a prior message — use reply_to_message_id (and the optional reply_to_text snippet) to know which thread they're responding to.",
+      '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
       "fetch_messages pulls real Discord history. Discord's search API isn't available to bots — if the user asks you to find an old message, fetch more history or ask them roughly when it was.",
@@ -1219,6 +1221,20 @@ async function handleInbound(msg: Message): Promise<void> {
   // forgeable by any allowlisted sender typing that string.
   const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
 
+  // Resolve reply-to reference (when the user used Discord's reply gesture).
+  // fetchReference can fail (deleted, missing perms) — fall back to having
+  // just reply_to_message_id without the user/text fields.
+  const replyToFields: Record<string, string> = {}
+  if (msg.reference?.messageId) {
+    replyToFields.reply_to_message_id = msg.reference.messageId
+    try {
+      const ref = await msg.fetchReference()
+      if (ref.author?.username) replyToFields.reply_to_user = ref.author.username
+      if (ref.author?.id) replyToFields.reply_to_user_id = ref.author.id
+      if (ref.content) replyToFields.reply_to_text = ref.content.slice(0, 200)
+    } catch {}
+  }
+
   mcp.notification({
     method: 'notifications/claude/channel',
     params: {
@@ -1230,6 +1246,7 @@ async function handleInbound(msg: Message): Promise<void> {
         user_id: msg.author.id,
         ts: msg.createdAt.toISOString(),
         ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
+        ...replyToFields,
       },
     },
   }).catch(err => {
