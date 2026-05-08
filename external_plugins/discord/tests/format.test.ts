@@ -8,6 +8,7 @@ import {
   splitTableIntoMessages,
   buildReplyMessages,
   findTablesInLines,
+  normalizeTableWidths,
   TABLE_MULTI_MESSAGE_THRESHOLD,
 } from '../format'
 
@@ -121,11 +122,76 @@ describe('findTablesInLines()', () => {
   })
 })
 
+describe('normalizeTableWidths()', () => {
+  test('aligns a plain 3-col 4-row table to uniform line width', () => {
+    const t = `| a | b | c |\n| --- | --- | --- |\n| 1 | 22 | 333 |\n| 4 | 55 | 666 |`
+    const out = normalizeTableWidths(t)
+    const outLines = out.split('\n')
+    expect(outLines.length).toBe(4)
+    // Every emitted line is the same length (true alignment).
+    const widths = outLines.map(l => l.length)
+    expect(new Set(widths).size).toBe(1)
+    // Separator dashes match column widths (each col padded to ≥3 chars).
+    expect(outLines[1]).toMatch(/^\| -{3,} \| -{3,} \| -{3,} \|$/)
+    // Cells include their content.
+    expect(outLines[2]).toContain('1')
+    expect(outLines[2]).toContain('22')
+    expect(outLines[2]).toContain('333')
+  })
+
+  test('preserves backticks and other markdown literally', () => {
+    const t = `| name | val |\n| --- | --- |\n| \`id\` | 5 |`
+    const out = normalizeTableWidths(t)
+    expect(out).toContain('`id`')
+    // Width is computed from `.length`, so 4-char ``id`` sets col 0 width to 4.
+    const lines = out.split('\n')
+    expect(new Set(lines.map(l => l.length)).size).toBe(1)
+  })
+
+  test('pads empty cells with spaces', () => {
+    const t = `| a | b | c |\n| --- | --- | --- |\n|  | 22 |  |`
+    const out = normalizeTableWidths(t)
+    const lines = out.split('\n')
+    expect(new Set(lines.map(l => l.length)).size).toBe(1)
+    // The empty-cell row still has 3 cells separated by `|`.
+    const row3Cells = lines[2].split('|').filter(s => s.length > 0)
+    expect(row3Cells.length).toBe(3)
+  })
+
+  test('preserves : alignment markers in separator', () => {
+    const t = `| a | b | c |\n| :--- | :---: | ---: |\n| 1 | 2 | 3 |`
+    const out = normalizeTableWidths(t)
+    const lines = out.split('\n')
+    // Four colons total: left-align (1) + center (2) + right-align (1).
+    const colonCount = (lines[1].match(/:/g) || []).length
+    expect(colonCount).toBe(4)
+    expect(lines[1]).toMatch(/^\| :-+ \| :-+: \| -+: \|$/)
+  })
+
+  test('single-row table (header + separator only) still normalizes', () => {
+    const t = `| a | bb |\n| --- | --- |`
+    const out = normalizeTableWidths(t)
+    const lines = out.split('\n')
+    expect(lines.length).toBe(2)
+    expect(new Set(lines.map(l => l.length)).size).toBe(1)
+  })
+
+  test('mismatched column counts: shorter rows padded with empty cells', () => {
+    const t = `| a | b | c |\n| --- | --- | --- |\n| 1 |`
+    const out = normalizeTableWidths(t)
+    const lines = out.split('\n')
+    expect(new Set(lines.map(l => l.length)).size).toBe(1)
+    // The padded short row still has 3 cell separators.
+    expect(lines[2].split('|').length).toBe(5) // ['', cell1, cell2, cell3, '']
+  })
+})
+
 describe('wrapPipeTablesAsCodeBlocks()', () => {
-  test('wraps a plain table in fences', () => {
+  test('wraps a plain table in fences (with normalized widths)', () => {
     const t = `before\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nafter`
     const out = wrapPipeTablesAsCodeBlocks(t)
-    expect(out).toContain('```\n| a | b |\n| --- | --- |\n| 1 | 2 |\n```')
+    // Normalization pads cells to width-3 (the min), so cells become 'a  ', 'b  ', etc.
+    expect(out).toContain('```\n| a   | b   |\n| --- | --- |\n| 1   | 2   |\n```')
     expect(out.startsWith('before')).toBe(true)
     expect(out.endsWith('after')).toBe(true)
   })
@@ -156,7 +222,8 @@ describe('wrapPipeTablesAsCodeBlocks()', () => {
     const t = `| a | b |\n| --- | --- |\n| 1 | 2 |\nThe symbol | denotes division.`
     const out = wrapPipeTablesAsCodeBlocks(t)
     // The `| 1 | 2 |` row is the last row; prose stays unwrapped.
-    expect(out).toContain('```\n| a | b |\n| --- | --- |\n| 1 | 2 |\n```\nThe symbol')
+    // Cells normalized to width-3.
+    expect(out).toContain('```\n| a   | b   |\n| --- | --- |\n| 1   | 2   |\n```\nThe symbol')
   })
 
   test('wraps multiple tables independently', () => {
@@ -207,9 +274,13 @@ describe('splitTableIntoMessages()', () => {
     const tbl = [header, sep, ...rows].join('\n')
     const out = splitTableIntoMessages('', tbl, '', 1900, 2000)
     expect(out.length).toBeGreaterThanOrEqual(2)
+    // Each chunk is a valid fenced block with header content + separator.
+    // After normalization, headers are padded — match by content (e.g. 'col1') not exact string.
     for (const m of out) {
-      expect(m.content).toContain(header)
-      expect(m.content).toContain(sep)
+      expect(m.content).toContain('col1')
+      expect(m.content).toContain('col2')
+      expect(m.content).toContain('---')
+      expect(m.content).toContain('```')
       expect(m.content.length).toBeLessThanOrEqual(2000)
     }
     // Continuations carry the marker; the first does not.
@@ -217,6 +288,30 @@ describe('splitTableIntoMessages()', () => {
     for (let k = 1; k < out.length; k++) {
       expect(out[k].content.startsWith('_continued (')).toBe(true)
     }
+  })
+
+  test('multi-message split: every chunk shares the same column widths', () => {
+    // Mix short and long rows so the un-normalized widths would differ
+    // chunk-to-chunk if normalization weren't applied to the full table.
+    const header = '| col1 | col2 |'
+    const sep = '| --- | --- |'
+    const shortRows = Array.from({ length: 50 }, (_, i) => `| s${i} | t${i} |`)
+    const longRows = Array.from({ length: 50 }, (_, i) => `| longrow${i}_xx | longrow${i}_yy |`)
+    const tbl = [header, sep, ...shortRows, ...longRows].join('\n')
+    const out = splitTableIntoMessages('', tbl, '', 1900, 2000)
+    expect(out.length).toBeGreaterThanOrEqual(2)
+
+    // Extract the header line (the line immediately after the opening fence)
+    // from each chunk and confirm they're identical across chunks.
+    const chunkHeaders = out.map(m => {
+      const lines = m.content.split('\n')
+      const fenceIdx = lines.indexOf('```')
+      return lines[fenceIdx + 1]
+    })
+    expect(new Set(chunkHeaders).size).toBe(1)
+
+    // Sanity: the shared header has been normalized to the longest-row width.
+    expect(chunkHeaders[0]).toMatch(/^\| col1\s+\| col2\s+\|$/)
   })
 
   test('attachment fallback when one row exceeds the per-message budget', () => {

@@ -36,6 +36,76 @@ function restoreCodeBlocks(text: string, blocks: string[]): string {
   return text.replace(PROTECT_RE, (_, n) => blocks[Number(n)])
 }
 
+// Parse a single table row line into trimmed cells. Strips one leading
+// and one trailing empty cell if the line had surrounding `|` (the
+// `| a | b |` style). Internal empty cells (`| a || c |`) are kept,
+// since they're meaningful gaps in the table.
+function parseTableRow(line: string): string[] {
+  const parts = line.split('|').map(s => s.trim())
+  if (parts.length > 1 && parts[0] === '') parts.shift()
+  if (parts.length > 0 && parts[parts.length - 1] === '') parts.pop()
+  return parts
+}
+
+// Re-emit a parsed table with each cell padded to its column's max width
+// (using `.padEnd`, i.e. content-left, padding-right). Inside a fenced
+// code block this gives Discord-friendly column alignment, since the
+// pipe-syntax table renderer doesn't exist for bot messages.
+//
+// Notes:
+//   - Width is taken over header + data rows; the separator's dashes are
+//     re-generated to fit the column width (min 3 dashes).
+//   - Alignment markers (`:` at cell start/end of the separator) are
+//     preserved in their original position; data rows are still
+//     left-padded (we don't honor `---:` right-alignment in monospace —
+//     the colon is a hint to readers, not enforced).
+//   - `.length` counts UTF-16 code units, not display columns. CJK and
+//     emoji that occupy 2 display cells will visually misalign by one
+//     cell per occurrence. Documented as a known caveat in CLAUDE_README.
+//   - Mismatched column counts: the row with the most columns sets the
+//     count; shorter rows are padded with empty trailing cells.
+export function normalizeTableWidths(tableBlock: string): string {
+  const lines = tableBlock.split('\n')
+  if (lines.length < 2) return tableBlock
+
+  const rows: string[][] = lines.map(parseTableRow)
+  const numCols = Math.max(...rows.map(r => r.length))
+  if (numCols === 0) return tableBlock
+
+  for (const row of rows) {
+    while (row.length < numCols) row.push('')
+  }
+
+  const colWidths: number[] = new Array(numCols).fill(0)
+  for (let r = 0; r < rows.length; r++) {
+    if (r === 1) continue // separator handled separately
+    for (let c = 0; c < numCols; c++) {
+      const len = rows[r][c].length
+      if (len > colWidths[c]) colWidths[c] = len
+    }
+  }
+  // Min 3 so the separator's `---` always renders as a separator.
+  for (let c = 0; c < numCols; c++) {
+    colWidths[c] = Math.max(3, colWidths[c])
+  }
+
+  const sepCells = rows[1].map((src, c) => {
+    const width = colWidths[c]
+    const leftAlign = src.startsWith(':')
+    const rightAlign = src.length > 1 && src.endsWith(':')
+    const dashCount = Math.max(1, width - (leftAlign ? 1 : 0) - (rightAlign ? 1 : 0))
+    return (leftAlign ? ':' : '') + '-'.repeat(dashCount) + (rightAlign ? ':' : '')
+  })
+
+  const out: string[] = []
+  for (let r = 0; r < rows.length; r++) {
+    const cells = r === 1 ? sepCells : rows[r]
+    const padded = cells.map((cell, c) => cell.padEnd(colWidths[c]))
+    out.push('| ' + padded.join(' | ') + ' |')
+  }
+  return out.join('\n')
+}
+
 // Find contiguous markdown-table blocks: header line containing `|`,
 // followed by a separator line (`:?-+:?` cells), followed by ≥1 data
 // rows whose pipe count matches the header (within ±1, to allow tables
@@ -69,20 +139,23 @@ export function findTablesInLines(lines: string[]): { start: number; end: number
   return out
 }
 
-// Wrap every pipe-table in `text` in plain ```...``` fences. Pre-existing
-// fenced code blocks are protected from double-wrapping (a stray `|` in
-// a code block won't trigger detection).
+// Wrap every pipe-table in `text` in plain ```...``` fences. Each table
+// is column-width-normalized first (so monospace rendering inside the
+// fence shows aligned columns). Pre-existing fenced code blocks are
+// protected from double-wrapping (a stray `|` in a code block won't
+// trigger detection).
 export function wrapPipeTablesAsCodeBlocks(text: string): string {
   const { protected: prot, blocks } = protectCodeBlocks(text)
   const lines = prot.split('\n')
   const tables = findTablesInLines(lines)
   if (tables.length === 0) return text
 
-  // Splice fences back-to-front so earlier indices stay valid as we go.
+  // Walk back-to-front so earlier (start, end) ranges stay valid.
   for (let k = tables.length - 1; k >= 0; k--) {
     const { start, end } = tables[k]
-    lines.splice(end, 0, '```')
-    lines.splice(start, 0, '```')
+    const tableBlock = lines.slice(start, end).join('\n')
+    const normalized = normalizeTableWidths(tableBlock).split('\n')
+    lines.splice(start, end - start, '```', ...normalized, '```')
   }
   return restoreCodeBlocks(lines.join('\n'), blocks)
 }
@@ -171,11 +244,14 @@ export function splitTableIntoMessages(
   tableThreshold: number,
   chunkLimit: number,
 ): OutboundMessage[] {
-  const lines = tableBlock.split('\n')
+  // Normalize widths over the FULL table once, so every emitted chunk
+  // shares the same column widths (rather than each chunk re-deriving
+  // widths from its own row subset, which would give jagged alignment
+  // between consecutive messages).
+  const normalized = normalizeTableWidths(tableBlock)
+  const lines = normalized.split('\n')
   if (lines.length < 3) {
-    // Malformed — caller's findTables shouldn't produce this, but if
-    // it does, fall back to plain chunking on the joined input.
-    return chunk([pre, tableBlock, post].filter(Boolean).join('\n').trim(), chunkLimit).map(
+    return chunk([pre, normalized, post].filter(Boolean).join('\n').trim(), chunkLimit).map(
       c => ({ content: c }),
     )
   }
@@ -195,8 +271,10 @@ export function splitTableIntoMessages(
   const longestRow = rows.length > 0 ? Math.max(...rows.map(r => r.length)) : 0
   if (longestRow + 1 > rowsBudget) {
     // Single-row overflow → attachment fallback for the table itself.
-    // Pre/post prose still gets sent inline.
-    const buf = Buffer.from(tableBlock, 'utf-8')
+    // Pre/post prose still gets sent inline. We attach the normalized
+    // version (already aligned) since that's what we've been working
+    // with — same content, nicer-looking in Discord's .md preview.
+    const buf = Buffer.from(normalized, 'utf-8')
     const attachment = new AttachmentBuilder(buf, { name: 'table.md' })
     const preMsgs = pre.trim()
       ? chunk(pre.trim(), chunkLimit).map(c => ({ content: c }))
