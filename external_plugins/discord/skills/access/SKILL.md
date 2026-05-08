@@ -125,14 +125,18 @@ to actually work once enabled.
 ### `set <key> <value>`
 
 Delivery/UX config. Supported keys: `ackReaction`, `replyToMode`,
-`textChunkLimit`, `chunkMode`, `mentionPatterns`. Validate types:
+`textChunkLimit`, `mentionPatterns`. Validate types:
 - `ackReaction`: string (emoji) or `""` to disable
 - `replyToMode`: `off` | `first` | `all`
 - `textChunkLimit`: number
-- `chunkMode`: `length` | `newline`
 - `mentionPatterns`: JSON array of regex strings
 
 Read, set the key, write, confirm.
+
+`chunkMode` was deprecated 2026-05-08 (the new chunker is line/word-aware
+unconditionally; old `'length'` / `'newline'` modes no longer apply).
+Existing `access.json` files with `chunkMode` set are silently ignored;
+no migration error.
 
 ---
 

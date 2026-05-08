@@ -85,9 +85,9 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
 
 **`replyToMode`** controls threading on chunked replies. When a long response is split, `first` (default) threads only the first chunk under the inbound message; `all` threads every chunk; `off` sends all chunks standalone.
 
-**`textChunkLimit`** sets the split threshold. Discord rejects messages over 2000 characters, which is the hard ceiling.
+**`textChunkLimit`** sets the split threshold. Discord rejects messages over 2000 characters, which is the hard ceiling. The splitter is line- and word-aware: it prefers paragraph boundaries, then linebreaks, then word boundaries; it never cuts mid-word unless a single word itself exceeds the limit.
 
-**`chunkMode`** chooses the split strategy: `length` cuts exactly at the limit; `newline` prefers paragraph boundaries.
+Pipe-delimited markdown tables are detected and wrapped in fenced code blocks before sending — Discord's client doesn't render `|`-table markdown, but a fenced block is monospace and preserves column alignment. Tables that don't fit a single message are split across multiple messages (each repeats the header + separator, with a `_continued (k/N)_` marker on continuations); a single row exceeding the per-message budget falls back to a `table.md` attachment.
 
 ## Skill reference
 
@@ -103,7 +103,7 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
 | `/discord:access group rm 846209781206941736` | Disable a guild channel. |
 | `/discord:access mgmt on` | Enable server-management tools (`create_channel`, `delete_channel`, `modify_channel`, `create_thread`, `start_forum_post`, `bulk_delete_messages`, `pin_message`, `unpin_message`, `get_audit_log`). Bot must also have the matching permissions granted in the Dev Portal. Off by default. |
 | `/discord:access mgmt off` | Disable management tools — they will refuse to run until re-enabled. |
-| `/discord:access set ackReaction 🔨` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`. |
+| `/discord:access set ackReaction 🔨` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `mentionPatterns`. |
 
 ## Config file
 
@@ -136,10 +136,8 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
   // Threading on chunked replies: first | all | off
   "replyToMode": "first",
 
-  // Split threshold. Discord rejects > 2000.
-  "textChunkLimit": 2000,
-
-  // length = cut at limit. newline = prefer paragraph boundaries.
-  "chunkMode": "newline"
+  // Split threshold. Discord rejects > 2000. The splitter is line/word-aware
+  // unconditionally; the old `chunkMode` field is deprecated and ignored on read.
+  "textChunkLimit": 2000
 }
 ```

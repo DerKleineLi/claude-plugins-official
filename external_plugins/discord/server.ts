@@ -27,6 +27,7 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ActionRowBuilder,
+  AttachmentBuilder,
   type Message,
   type Attachment,
   type Interaction,
@@ -35,6 +36,7 @@ import {
   type User,
   type PartialUser,
 } from 'discord.js'
+import { buildReplyMessages, MAX_CHUNK_LIMIT } from './format'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
@@ -127,8 +129,6 @@ type Access = {
   replyToMode?: 'off' | 'first' | 'all'
   /** Max chars per outbound message before splitting. Default: 2000 (Discord's hard cap). */
   textChunkLimit?: number
-  /** Split on paragraph boundaries instead of hard char count. */
-  chunkMode?: 'length' | 'newline'
   /** Enable server-management tools (create_channel, delete_channel, ...). Off by default. */
   mgmtEnabled?: boolean
 }
@@ -142,8 +142,9 @@ function defaultAccess(): Access {
   }
 }
 
-const MAX_CHUNK_LIMIT = 2000
-const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+// Discord's free-tier file cap is 10 MB (lowered from 25 MB in 2024). Boosted
+// servers can go higher, but bots don't get that — we'd just collect 400s.
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 
 // reply's files param takes any path. .env is ~60 bytes and ships as an
 // upload. Claude can already Read+paste file contents, so this isn't a new
@@ -174,7 +175,9 @@ function readAccessFile(): Access {
       ackReaction: parsed.ackReaction,
       replyToMode: parsed.replyToMode,
       textChunkLimit: parsed.textChunkLimit,
-      chunkMode: parsed.chunkMode,
+      // chunkMode (deprecated 2026-05-08): silently ignored on read. The new
+      // chunk() in format.ts is line/word-aware unconditionally; the old
+      // 'length' / 'newline' modes are no longer meaningful.
       mgmtEnabled: parsed.mgmtEnabled,
     }
   } catch (err) {
@@ -379,31 +382,6 @@ function checkApprovals(): void {
 }
 
 if (!STATIC) setInterval(checkApprovals, 5000).unref()
-
-// Discord caps messages at 2000 chars (hard limit — larger sends reject).
-// Split long replies, preferring paragraph boundaries when chunkMode is
-// 'newline'.
-
-function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[] {
-  if (text.length <= limit) return [text]
-  const out: string[] = []
-  let rest = text
-  while (rest.length > limit) {
-    let cut = limit
-    if (mode === 'newline') {
-      // Prefer the last double-newline (paragraph), then single newline,
-      // then space. Fall back to hard cut.
-      const para = rest.lastIndexOf('\n\n', limit)
-      const line = rest.lastIndexOf('\n', limit)
-      const space = rest.lastIndexOf(' ', limit)
-      cut = para > limit / 2 ? para : line > limit / 2 ? line : space > 0 ? space : limit
-    }
-    out.push(rest.slice(0, cut))
-    rest = rest.slice(cut).replace(/^\n+/, '')
-  }
-  if (rest) out.push(rest)
-  return out
-}
 
 async function fetchTextChannel(id: string) {
   const ch = await client.channels.fetch(id)
@@ -896,20 +874,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         const access = loadAccess()
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
-        const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
+        // buildReplyMessages handles three cases: plain prose (line/word-aware
+        // chunking), prose with small tables (in-place fenced wrap), and prose
+        // with a >1900-char table (multi-message split with header repeated, or
+        // .md attachment fallback if a single row alone overflows).
+        const messages = buildReplyMessages(text, limit)
         const sentIds: string[] = []
 
         try {
-          for (let i = 0; i < chunks.length; i++) {
+          for (let i = 0; i < messages.length; i++) {
+            const m = messages[i]
             const shouldReplyTo =
               reply_to != null &&
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
+            // User-supplied `files` (param) attach only to the first outbound
+            // message. Per-message `m.files` (e.g. the attachment-fallback
+            // table.md buffer) attach to whichever message owns them.
+            const messageFiles = m.files ?? []
+            const finalFiles = i === 0 ? [...files, ...messageFiles] : messageFiles
             const sent = await ch.send({
-              content: chunks[i],
-              ...(i === 0 && files.length > 0 ? { files } : {}),
+              content: m.content,
+              ...(finalFiles.length > 0 ? { files: finalFiles } : {}),
               ...(shouldReplyTo
                 ? { reply: { messageReference: reply_to, failIfNotExists: false } }
                 : {}),
@@ -919,7 +906,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
-          throw new Error(`reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`)
+          throw new Error(`reply failed after ${sentIds.length} of ${messages.length} message(s) sent: ${msg}`)
         }
 
         const result =

@@ -4,7 +4,7 @@ Project memory for future-you (Claude). User-facing docs are in `README.md` and 
 
 ## What this is
 
-The user's Discord channel plugin — an MCP server (`server.ts`, single file ~1k LOC) that bridges Discord to a Claude Code session. Originally forked from [`anthropics/claude-plugins-official`](https://github.com/anthropics/claude-plugins-official); the active branch is `local/main` of `DerKleineLi/claude-plugins-official` (the user's fork). Local edits live on top of upstream.
+The user's Discord channel plugin — an MCP server (`server.ts`, the wired entry point, ~1k LOC; `format.ts` for pure message-formatting helpers, ~200 LOC; tests under `tests/`) that bridges Discord to a Claude Code session. Originally forked from [`anthropics/claude-plugins-official`](https://github.com/anthropics/claude-plugins-official); the active branch is `local/main` of `DerKleineLi/claude-plugins-official` (the user's fork). Local edits live on top of upstream.
 
 ## Live deployment
 
@@ -23,6 +23,15 @@ This unification (bare MCP server + `--plugin-dir`, no marketplace) was settled 
 - **2026-05-08** — Forward `reply_to_message_id` (and `reply_to_user`/`reply_to_user_id`/`reply_to_text`) on inbound channel blocks. Parity with telegram fork commit `bfeb345`.
 - **2026-05-08** — Forward emoji reactions (`messageReactionAdd`/`Remove` → `<channel … reaction="…">` block). Parity with telegram fork commit `c90b380`.
 - **2026-05-08** — Channel inspection: `get_channel` (read-only) returns full metadata as JSON, including forum `available_tags` with their server-assigned IDs. `modify_channel` now also returns the full updated state in its response, so creating a tag and applying it to a post is a 2-call sequence (modify → start_forum_post with `applied_tags`) instead of 3 (modify → get → start_forum_post).
+- **2026-05-08** — Reply-rendering pipeline (`format.ts`, new module). Four user-visible changes, applied to every outbound `reply` call:
+  1. **Smart chunker.** Hierarchy: paragraph (`\n\n`) → line (`\n`) → word (space) → hard cut. Never splits mid-word unless a single word exceeds the limit; never splits mid-line unless a single line does. The legacy `chunkMode` config field (`'length'` | `'newline'`) is deprecated and silently ignored on read; one mode now.
+  2. **Pipe-table → fenced code block.** Discord's client does not render `|`-table markdown ([open feature request](https://support.discord.com/hc/en-us/community/posts/16131946321815)) — `wrapPipeTablesAsCodeBlocks` detects header + `:?-+:?` separator + ≥1 data rows and wraps the block in plain ` ``` `. Pre-existing fenced code blocks are protected from double-wrapping. Pipe-count check on data rows prevents the table from extending into prose that contains a stray `|`.
+  3. **Multi-message table split.** When a wrapped table would exceed 1900 chars, `splitTableIntoMessages` packs rows greedily across multiple sends, each one a stand-alone fenced block beginning with the original header + separator. Continuation messages (k > 1) are prefixed with `_continued (k/N)_` on a line above the fence.
+  4. **`.md` attachment fallback.** When a single row alone exceeds the per-message row budget, the raw table is sent as a `table.md` buffer attachment with a one-line summary in `content`. Pre/post prose around the table is still sent inline.
+
+  Side: `MAX_ATTACHMENT_BYTES` was lowered 25 → 10 MB to match Discord's 2024 free-tier cap (the old value would let oversize files through `assertSendable` only to be rejected by Discord's API).
+
+  Pure helpers live in `format.ts` (no I/O); unit-tested via `bun test tests/format.test.ts`.
 
 ## Architecture rationale
 
