@@ -3,14 +3,11 @@
 import { describe, test, expect } from 'bun:test'
 import {
   chunk,
-  wrapPipeTablesAsCodeBlocks,
-  detectOversizedTable,
-  splitTableIntoMessages,
   buildReplyMessages,
+  buildReplyMessagesWith,
   findTablesInLines,
   normalizeTableWidths,
   getOpenFenceAtEnd,
-  TABLE_MULTI_MESSAGE_THRESHOLD,
 } from '../format'
 
 describe('chunk()', () => {
@@ -418,209 +415,201 @@ describe('normalizeTableWidths()', () => {
   })
 })
 
-describe('wrapPipeTablesAsCodeBlocks()', () => {
-  test('wraps a plain table in fences (with normalized widths)', () => {
-    const t = `before\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nafter`
-    const out = wrapPipeTablesAsCodeBlocks(t)
-    // Normalization pads cells to width-3 (the min), so cells become 'a  ', 'b  ', etc.
-    expect(out).toContain('```\n| a   | b   |\n| --- | --- |\n| 1   | 2   |\n```')
-    expect(out.startsWith('before')).toBe(true)
-    expect(out.endsWith('after')).toBe(true)
-  })
+// --- buildReplyMessages: element-attachment pipeline ---
+//
+// We test against `buildReplyMessagesWith` so we can inject deterministic
+// stub renderers — the production renderers (satori + mathjax) are
+// expensive and pull in heavy I/O. End-to-end with the real renderers is
+// covered by smoke tests in tests/_demo_render.ts and live-verify.
 
-  test('preserves links inside cells', () => {
-    const t = `| name | url |\n| --- | --- |\n| foo | [link](https://x.y) |`
-    const out = wrapPipeTablesAsCodeBlocks(t)
-    expect(out).toContain('[link](https://x.y)')
-    expect(out.startsWith('```')).toBe(true)
-    expect(out.endsWith('```')).toBe(true)
-  })
+const stubTablePng = async (_md: string): Promise<Buffer> => Buffer.from('PNG-TABLE-STUB')
+const stubFormulaPng = async (_tex: string): Promise<Buffer> => Buffer.from('PNG-FORMULA-STUB')
+const failingTablePng = async (_md: string): Promise<Buffer> => { throw new Error('synthetic table render failure') }
+const failingFormulaPng = async (_tex: string): Promise<Buffer> => { throw new Error('synthetic formula render failure') }
 
-  test('does not double-wrap a pre-existing code block containing pipes', () => {
-    const t = '```\n| not | a | table |\n```'
-    const out = wrapPipeTablesAsCodeBlocks(t)
-    // Original two fences only — no extra wrapping.
-    const fenceCount = (out.match(/```/g) || []).length
-    expect(fenceCount).toBe(2)
-    expect(out).toBe(t)
-  })
+const fileNames = (m: { files?: { name?: string | null }[] }): string[] =>
+  (m.files ?? []).map(f => f.name ?? '').filter(Boolean)
 
-  test('no-op on text without tables', () => {
-    const t = 'just some prose, no tables here.'
-    expect(wrapPipeTablesAsCodeBlocks(t)).toBe(t)
-  })
-
-  test('does not extend table into prose with stray pipe', () => {
-    const t = `| a | b |\n| --- | --- |\n| 1 | 2 |\nThe symbol | denotes division.`
-    const out = wrapPipeTablesAsCodeBlocks(t)
-    // The `| 1 | 2 |` row is the last row; prose stays unwrapped.
-    // Cells normalized to width-3.
-    expect(out).toContain('```\n| a   | b   |\n| --- | --- |\n| 1   | 2   |\n```\nThe symbol')
-  })
-
-  test('wraps multiple tables independently', () => {
-    const t = `| a | b |\n| - | - |\n| 1 | 2 |\n\nbetween\n\n| c | d |\n| - | - |\n| 3 | 4 |`
-    const out = wrapPipeTablesAsCodeBlocks(t)
-    const fenceCount = (out.match(/```/g) || []).length
-    expect(fenceCount).toBe(4)
-  })
-})
-
-describe('detectOversizedTable()', () => {
-  test('returns null for a short table', () => {
-    const t = `| a | b |\n| - | - |\n| 1 | 2 |`
-    expect(detectOversizedTable(t, 1900)).toBe(null)
-  })
-
-  test('detects a table whose wrapped size exceeds threshold', () => {
-    const header = '| col1 | col2 |'
-    const sep = '| --- | --- |'
-    const rows = Array.from({ length: 100 }, (_, i) => `| row${i}_x | row${i}_y |`)
-    const tbl = [header, sep, ...rows].join('\n')
-    const result = detectOversizedTable(tbl, 1900)
-    expect(result).not.toBe(null)
-    expect(result?.table).toBe(tbl)
-    expect(result?.pre).toBe('')
-    expect(result?.post).toBe('')
-  })
-
-  test('preserves pre and post prose around an oversized table', () => {
-    const header = '| col1 | col2 |'
-    const sep = '| --- | --- |'
-    const rows = Array.from({ length: 100 }, (_, i) => `| row${i}_x | row${i}_y |`)
-    const tbl = [header, sep, ...rows].join('\n')
-    const t = `intro paragraph\n\n${tbl}\n\noutro paragraph`
-    const result = detectOversizedTable(t, 1900)
-    expect(result).not.toBe(null)
-    expect(result?.pre.trim()).toBe('intro paragraph')
-    expect(result?.post.trim()).toBe('outro paragraph')
-    expect(result?.table).toBe(tbl)
-  })
-})
-
-describe('splitTableIntoMessages()', () => {
-  test('splits a long table into multiple messages, each with header+sep', () => {
-    const header = '| col1 | col2 |'
-    const sep = '| --- | --- |'
-    const rows = Array.from({ length: 100 }, (_, i) => `| row${i}_x | row${i}_y |`)
-    const tbl = [header, sep, ...rows].join('\n')
-    const out = splitTableIntoMessages('', tbl, '', 1900, 2000)
-    expect(out.length).toBeGreaterThanOrEqual(2)
-    // Each chunk is a valid fenced block with header content + separator.
-    // After normalization, headers are padded — match by content (e.g. 'col1') not exact string.
-    for (const m of out) {
-      expect(m.content).toContain('col1')
-      expect(m.content).toContain('col2')
-      expect(m.content).toContain('---')
-      expect(m.content).toContain('```')
-      expect(m.content.length).toBeLessThanOrEqual(2000)
-    }
-    // Continuations carry the marker; the first does not.
-    expect(out[0].content.startsWith('_continued (')).toBe(false)
-    for (let k = 1; k < out.length; k++) {
-      expect(out[k].content.startsWith('_continued (')).toBe(true)
-    }
-  })
-
-  test('multi-message split: every chunk shares the same column widths', () => {
-    // Mix short and long rows so the un-normalized widths would differ
-    // chunk-to-chunk if normalization weren't applied to the full table.
-    const header = '| col1 | col2 |'
-    const sep = '| --- | --- |'
-    const shortRows = Array.from({ length: 50 }, (_, i) => `| s${i} | t${i} |`)
-    const longRows = Array.from({ length: 50 }, (_, i) => `| longrow${i}_xx | longrow${i}_yy |`)
-    const tbl = [header, sep, ...shortRows, ...longRows].join('\n')
-    const out = splitTableIntoMessages('', tbl, '', 1900, 2000)
-    expect(out.length).toBeGreaterThanOrEqual(2)
-
-    // Extract the header line (the line immediately after the opening fence)
-    // from each chunk and confirm they're identical across chunks.
-    const chunkHeaders = out.map(m => {
-      const lines = m.content.split('\n')
-      const fenceIdx = lines.indexOf('```')
-      return lines[fenceIdx + 1]
-    })
-    expect(new Set(chunkHeaders).size).toBe(1)
-
-    // Sanity: the shared header has been normalized to the longest-row width.
-    expect(chunkHeaders[0]).toMatch(/^\| col1\s+\| col2\s+\|$/)
-  })
-
-  test('attachment fallback when one row exceeds the per-message budget', () => {
-    const header = '| huge |'
-    const sep = '| --- |'
-    const giantRow = `| ${'x'.repeat(2500)} |`
-    const tbl = [header, sep, giantRow].join('\n')
-    const out = splitTableIntoMessages('', tbl, '', 1900, 2000)
-    const withFiles = out.find(m => m.files && m.files.length > 0)
-    expect(withFiles).toBeDefined()
-    expect(withFiles!.content.toLowerCase()).toContain('attachment')
-    expect(withFiles!.files![0].name).toBe('table.md')
-  })
-
-  test('attachment fallback preserves pre/post prose around the table', () => {
-    const header = '| h |'
-    const sep = '| - |'
-    const giant = `| ${'y'.repeat(2500)} |`
-    const tbl = [header, sep, giant].join('\n')
-    const out = splitTableIntoMessages('intro', tbl, 'outro', 1900, 2000)
-    expect(out.length).toBe(3)
-    expect(out[0].content).toBe('intro')
-    expect(out[1].files).toBeDefined()
-    expect(out[2].content).toBe('outro')
-  })
-
-  test('chunks long pre/post prose using the standard chunker', () => {
-    const header = '| c1 | c2 |'
-    const sep = '| - | - |'
-    const rows = Array.from({ length: 100 }, (_, i) => `| r${i}_x | r${i}_y |`)
-    const tbl = [header, sep, ...rows].join('\n')
-    const longPre = ('a'.repeat(100) + '\n').repeat(30) // 3030 chars
-    const out = splitTableIntoMessages(longPre, tbl, '', 1900, 2000)
-    // Pre prose chunks come first; should be at least 2 (3030 / ~2000).
-    const preChunks = out.filter(m => m.content.startsWith('a'))
-    expect(preChunks.length).toBeGreaterThanOrEqual(2)
-  })
-})
-
-describe('buildReplyMessages() — end-to-end routing', () => {
-  test('plain text → single chunk', () => {
-    const out = buildReplyMessages('hello world', 2000)
+describe('buildReplyMessages() — plain prose', () => {
+  test('plain text passes through as a single message with no files', async () => {
+    const out = await buildReplyMessagesWith('hello world', 2000, stubTablePng, stubFormulaPng)
     expect(out.length).toBe(1)
     expect(out[0].content).toBe('hello world')
     expect(out[0].files).toBeUndefined()
   })
 
-  test('text with a small table → wrapped, single message', () => {
-    const t = `| a | b |\n| - | - |\n| 1 | 2 |`
-    const out = buildReplyMessages(t, 2000)
-    expect(out.length).toBe(1)
-    expect(out[0].content).toContain('```')
-  })
-
-  test('text with a large table → multi-message split', () => {
-    const header = '| col1 | col2 |'
-    const sep = '| --- | --- |'
-    const rows = Array.from({ length: 200 }, (_, i) => `| row${i}_x | row${i}_y |`)
-    const tbl = [header, sep, ...rows].join('\n')
-    const out = buildReplyMessages(tbl, 2000)
-    expect(out.length).toBeGreaterThanOrEqual(2)
-    // Every message stays under the chunk limit.
-    for (const m of out) {
-      expect(m.content.length).toBeLessThanOrEqual(2000)
-    }
-  })
-
-  test('long prose without tables uses paragraph-aware chunker', () => {
+  test('long prose is paragraph-chunked', async () => {
     const t = ('paragraph text. '.repeat(50) + '\n\n').repeat(10)
-    const out = buildReplyMessages(t, 2000)
+    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
     expect(out.length).toBeGreaterThan(1)
     for (const m of out) {
       expect(m.content.length).toBeLessThanOrEqual(2000)
+      expect(m.files).toBeUndefined()
     }
   })
+})
 
-  test('TABLE_MULTI_MESSAGE_THRESHOLD is 1900 (sanity)', () => {
-    expect(TABLE_MULTI_MESSAGE_THRESHOLD).toBe(1900)
+describe('buildReplyMessages() — tables', () => {
+  test('single table → 1 file message with PNG + .md', async () => {
+    const t = `| a | b |\n|---|---|\n| 1 | 2 |`
+    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    expect(out.length).toBe(1)
+    expect(out[0].content).toBe('')
+    expect(fileNames(out[0])).toEqual(['table-1.png', 'table-1.md'])
+  })
+
+  test('table with surrounding prose → 3 messages (prose + file + prose)', async () => {
+    const t = 'before\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nafter'
+    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    expect(out.length).toBe(3)
+    expect(out[0].content).toBe('before')
+    expect(out[1].content).toBe('')
+    expect(fileNames(out[1])).toEqual(['table-1.png', 'table-1.md'])
+    expect(out[2].content).toBe('after')
+  })
+
+  test('two tables → 5 messages (prose + file + prose + file + prose, with prose elided when empty)', async () => {
+    const t = [
+      'A.',
+      '',
+      '| a | b |',
+      '|---|---|',
+      '| 1 | 2 |',
+      '',
+      'between',
+      '',
+      '| c | d |',
+      '|---|---|',
+      '| 3 | 4 |',
+      '',
+      'C.',
+    ].join('\n')
+    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    const seq = out.map(m => (m.files && m.files.length ? `files:${fileNames(m).join(',')}` : `prose:${m.content}`))
+    expect(seq).toEqual([
+      'prose:A.',
+      'files:table-1.png,table-1.md',
+      'prose:between',
+      'files:table-2.png,table-2.md',
+      'prose:C.',
+    ])
+  })
+
+  test('table PNG render failure → ships .md only (split still happens)', async () => {
+    const t = '| a | b |\n|---|---|\n| 1 | 2 |'
+    const out = await buildReplyMessagesWith(t, 2000, failingTablePng, stubFormulaPng)
+    expect(out.length).toBe(1)
+    expect(fileNames(out[0])).toEqual(['table-1.md'])
+  })
+})
+
+describe('buildReplyMessages() — formulas', () => {
+  test('display formula on its own line → 1 file message with PNG + .tex', async () => {
+    const t = '$$E = mc^2$$'
+    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    expect(out.length).toBe(1)
+    expect(out[0].content).toBe('')
+    expect(fileNames(out[0])).toEqual(['formula-1.png', 'formula-1.tex'])
+  })
+
+  test('formula PNG render failure → falls back to inline ```tex code-block', async () => {
+    const t = 'before\n\n$$E = mc^2$$\n\nafter'
+    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, failingFormulaPng)
+    expect(out.length).toBe(3)
+    expect(out[0].content).toBe('before')
+    expect(out[1].content).toBe('```tex\nE = mc^2\n```')
+    expect(out[1].files).toBeUndefined()
+    expect(out[2].content).toBe('after')
+  })
+
+  test('inline $...$ math stays inside prose', async () => {
+    const t = 'the constant $\\pi$ is irrational'
+    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    expect(out.length).toBe(1)
+    expect(out[0].content).toBe(t)
+    expect(out[0].files).toBeUndefined()
+  })
+})
+
+describe('buildReplyMessages() — code blocks', () => {
+  test('python code-block → 1 file message named code-1.py', async () => {
+    const t = '```python\nprint("hi")\n```'
+    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    expect(out.length).toBe(1)
+    expect(out[0].content).toBe('')
+    expect(fileNames(out[0])).toEqual(['code-1.py'])
+  })
+
+  test('json code-block → code-1.json', async () => {
+    const t = '```json\n{"a": 1}\n```'
+    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    expect(fileNames(out[0])).toEqual(['code-1.json'])
+  })
+
+  test('multiple known-lang code-blocks counter → code-1, code-2', async () => {
+    const t = '```py\na = 1\n```\n\n```ts\nlet b = 2\n```'
+    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    const fileMsgs = out.filter(m => m.files && m.files.length > 0)
+    expect(fileMsgs.length).toBe(2)
+    expect(fileNames(fileMsgs[0])).toEqual(['code-1.py'])
+    expect(fileNames(fileMsgs[1])).toEqual(['code-2.ts'])
+  })
+
+  test('no-lang code-block stays inline in prose', async () => {
+    const t = '```\nplain\n```'
+    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    expect(out.length).toBe(1)
+    expect(out[0].content).toBe('```\nplain\n```')
+    expect(out[0].files).toBeUndefined()
+  })
+
+  test('unknown-lang code-block stays inline in prose', async () => {
+    const t = '```madeuplang\nfoo\n```'
+    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    expect(out.length).toBe(1)
+    expect(out[0].content).toBe('```madeuplang\nfoo\n```')
+    expect(out[0].files).toBeUndefined()
+  })
+})
+
+describe('buildReplyMessages() — mixed', () => {
+  test('prose + table + prose + formula + prose + code → 6 alternating messages', async () => {
+    const t = [
+      'A.',
+      '',
+      '| a | b |',
+      '|---|---|',
+      '| 1 | 2 |',
+      '',
+      'B.',
+      '',
+      '$$x = 1$$',
+      '',
+      'C.',
+      '',
+      '```python',
+      'print("hi")',
+      '```',
+    ].join('\n')
+    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    const seq = out.map(m =>
+      m.files && m.files.length ? `files:${fileNames(m).join(',')}` : `prose:${m.content}`,
+    )
+    expect(seq).toEqual([
+      'prose:A.',
+      'files:table-1.png,table-1.md',
+      'prose:B.',
+      'files:formula-1.png,formula-1.tex',
+      'prose:C.',
+      'files:code-1.py',
+    ])
+  })
+
+  test('async buildReplyMessages (default) returns a Promise', async () => {
+    const result = buildReplyMessages('hello', 2000)
+    expect(result).toBeInstanceOf(Promise)
+    const out = await result
+    expect(out.length).toBe(1)
+    expect(out[0].content).toBe('hello')
   })
 })
