@@ -195,7 +195,34 @@ export function detectOversizedTable(
 // Trailing whitespace is trimmed per chunk. Splitting NEVER happens
 // mid-line unless a single line is itself > limit, and NEVER mid-word
 // unless a single word is > limit.
+//
+// When the input contains fenced code blocks (```...```), splits that
+// would otherwise leave a fence open across the boundary are made
+// safe: a synthetic closing fence is appended to the chunk before the
+// boundary, and a matching opening fence (with the original lang tag
+// and backtick count) is prepended to the chunk after. Each emitted
+// chunk is then valid Discord markdown on its own. The per-chunk
+// limit is reduced by FENCE_RESERVE in this case so the injected
+// markers fit within `limit`.
 export function chunk(text: string, limit: number = MAX_CHUNK_LIMIT): string[] {
+  if (text.length <= limit) return [text]
+  if (!text.includes('```')) return chunkRaw(text, limit)
+  const innerLimit = Math.max(MIN_INNER_LIMIT, limit - FENCE_RESERVE)
+  return injectFenceMarkers(chunkRaw(text, innerLimit))
+}
+
+// Worst-case overhead per chunk for fence injection: an opener at the
+// start (≤4 backticks + clamped lang up to MAX_LANG_LEN + newline)
+// plus a closer at the end (newline + ≤4 backticks). 64 leaves a
+// comfortable cushion above that.
+const FENCE_RESERVE = 64
+const MIN_INNER_LIMIT = 64
+const MAX_LANG_LEN = 50
+
+// The original line/word/paragraph-aware splitter, no awareness of code
+// fences. chunk() wraps this with fence-injection logic when fences
+// are present in the input.
+function chunkRaw(text: string, limit: number): string[] {
   if (text.length <= limit) return [text]
   const out: string[] = []
   let rest = text
@@ -222,6 +249,68 @@ export function chunk(text: string, limit: number = MAX_CHUNK_LIMIT): string[] {
     rest = rest.slice(cut)
   }
   if (rest) out.push(rest)
+  return out
+}
+
+// Returns the open-fence state at the end of `text`, or null if every
+// fence in `text` is balanced. Used by the chunker to decide whether
+// a chunk boundary needs a synthetic closer/opener.
+//
+// Detection rules (CommonMark-flavored, simplified for Discord):
+//   - A fence line is a line whose first non-whitespace run is ≥3
+//     backticks, optionally followed by an "info string" (typically
+//     a language tag like `python` or `ts`).
+//   - When outside a fence, the first such line opens one. The lang
+//     is the trimmed remainder (clamped to MAX_LANG_LEN to keep
+//     re-emitted openers within the per-chunk fence budget).
+//   - When inside a fence, a line closes it ONLY if its backtick run
+//     is ≥ the opener's count AND there is no extra non-whitespace
+//     content on the line. Inline backticks (e.g. `let x = 1`) on
+//     content lines are ignored — they don't satisfy the leading-≥3
+//     rule.
+//   - 4-backtick fences nest 3-backtick fences (a 3-tick line inside
+//     a 4-tick block is content, not a closer).
+export function getOpenFenceAtEnd(
+  text: string,
+): { lang: string; fenceLen: number } | null {
+  let state: { lang: string; fenceLen: number } | null = null
+  for (const line of text.split('\n')) {
+    const m = line.match(/^\s*(`{3,})\s*(\S.*)?$/)
+    if (!m) continue
+    const len = m[1].length
+    const rest = (m[2] ?? '').trim()
+    if (state === null) {
+      state = { lang: rest.slice(0, MAX_LANG_LEN), fenceLen: len }
+    } else if (len >= state.fenceLen && rest === '') {
+      state = null
+    }
+  }
+  return state
+}
+
+// Walk a list of raw chunks and, at every boundary that falls inside
+// an open fence, append a closer to the chunk before and prepend a
+// matching opener to the chunk after. Each output chunk is then
+// independently fence-balanced.
+function injectFenceMarkers(chunks: string[]): string[] {
+  if (chunks.length <= 1) return chunks
+  const out: string[] = []
+  let openFromPrev: { lang: string; fenceLen: number } | null = null
+  for (let i = 0; i < chunks.length; i++) {
+    let body = chunks[i]
+    if (openFromPrev !== null) {
+      const opener = '`'.repeat(openFromPrev.fenceLen) + openFromPrev.lang
+      body = opener + '\n' + body
+    }
+    // Recompute on the augmented body so a re-opened fence is counted.
+    const stateNow = getOpenFenceAtEnd(body)
+    const isLast = i === chunks.length - 1
+    if (stateNow !== null && !isLast) {
+      body = body + '\n' + '`'.repeat(stateNow.fenceLen)
+    }
+    out.push(body)
+    openFromPrev = !isLast ? stateNow : null
+  }
   return out
 }
 

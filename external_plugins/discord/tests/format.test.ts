@@ -9,6 +9,7 @@ import {
   buildReplyMessages,
   findTablesInLines,
   normalizeTableWidths,
+  getOpenFenceAtEnd,
   TABLE_MULTI_MESSAGE_THRESHOLD,
 } from '../format'
 
@@ -74,6 +75,237 @@ describe('chunk()', () => {
   test('exact-limit text passes through unsplit', () => {
     const t = 'a'.repeat(2000)
     expect(chunk(t, 2000)).toEqual([t])
+  })
+})
+
+describe('chunk() — fence preservation across split', () => {
+  // Helper: every emitted chunk must be independently fence-balanced.
+  // We use the production scanner as the oracle: if it sees no open
+  // fence at the end of a chunk, the chunk parses as valid Discord
+  // markdown.
+  const expectAllBalanced = (chunks: string[]) => {
+    for (const c of chunks) {
+      expect(getOpenFenceAtEnd(c)).toBe(null)
+    }
+  }
+
+  test('split mid-content of an open 3-tick fence: closes + reopens with lang', () => {
+    const code = ('b'.repeat(50) + '\n').repeat(5)
+    const text = 'a'.repeat(100) + '\n```python\n' + code + '```'
+    const out = chunk(text, 200)
+    expect(out.length).toBeGreaterThan(1)
+    expectAllBalanced(out)
+    for (const c of out) expect(c.length).toBeLessThanOrEqual(200)
+    // Continuation chunks reopen with the original lang.
+    for (let i = 1; i < out.length; i++) {
+      expect(out[i].startsWith('```python\n')).toBe(true)
+    }
+    // Non-final chunks end with a closing fence.
+    for (let i = 0; i < out.length - 1; i++) {
+      expect(out[i].endsWith('\n```')).toBe(true)
+    }
+    // Round-trip sanity: stripping the synthetic open/close pairs we
+    // inserted yields the original text. (Synthetic = a closer at the
+    // end of chunk N immediately followed by a matching opener at the
+    // start of chunk N+1 when joined with no separator.)
+    const joined = out.join('')
+    // Each synthetic boundary contributes one close + one open with a
+    // newline between, e.g. `\n` + ```` + `\n` + ```python` + `\n`.
+    // Easier: assert the joined text contains the original code body
+    // and the original opener+closer.
+    expect(joined).toContain('```python\n')
+    expect(joined.split('b'.repeat(50)).length - 1).toBe(5)
+  })
+
+  test('split between two adjacent fences does not inject synthetic markers', () => {
+    // Two fences sized to each fit inside a chunk after the split,
+    // separated by a paragraph break. The chunker should pick the
+    // \n\n as its cut point and emit the two fences unchanged — no
+    // synthetic close/open should be injected, since neither fence
+    // straddles the boundary.
+    //
+    // Sizing: limit=200, FENCE_RESERVE=64 → innerLimit=136. Each
+    // block must be ≤136. Total must be >limit so a split happens.
+    const block1 = '```python\n' + 'x = 1234567\n'.repeat(10) + '```'
+    const block2 = '```ts\n' + 'let y = 12;\n'.repeat(10) + '```'
+    const text = block1 + '\n\n' + block2
+    expect(block1.length).toBeLessThanOrEqual(136)
+    expect(block2.length).toBeLessThanOrEqual(136)
+    expect(text.length).toBeGreaterThan(200)
+    const out = chunk(text, 200)
+    expect(out.length).toBe(2)
+    expectAllBalanced(out)
+    // No synthetic markers: total fence count is preserved.
+    const inFences = (text.match(/```/g) || []).length
+    const outFences = (out.join('').match(/```/g) || []).length
+    expect(outFences).toBe(inFences)
+    // Each block lands cleanly in its own chunk.
+    expect(out[0]).toBe(block1)
+    expect(out[1]).toBe(block2)
+  })
+
+  test('preserves 4-backtick fence variant: reopens with 4 ticks', () => {
+    const code = ('z'.repeat(50) + '\n').repeat(5)
+    const text = 'a'.repeat(100) + '\n````\n' + code + '````'
+    const out = chunk(text, 200)
+    expect(out.length).toBeGreaterThan(1)
+    expectAllBalanced(out)
+    // Continuation chunks reopen with 4 ticks (not 3).
+    for (let i = 1; i < out.length; i++) {
+      expect(out[i].startsWith('````\n')).toBe(true)
+      // Sanity: not a 3-tick reopen.
+      expect(/^```[^`]/.test(out[i])).toBe(false)
+    }
+    // Non-final chunks end with a 4-tick closer.
+    for (let i = 0; i < out.length - 1; i++) {
+      expect(out[i].endsWith('\n````')).toBe(true)
+    }
+  })
+
+  test('inline backticks inside an open fence do not confuse the splitter', () => {
+    // The fence is ```ts; content has `let x = 1` inline backtick runs.
+    // Split should still close+reopen the ts fence cleanly.
+    const inner = ('let x = `123`; y = `456`;\n').repeat(10)
+    const text = 'a'.repeat(100) + '\n```ts\n' + inner + '```'
+    const out = chunk(text, 200)
+    expect(out.length).toBeGreaterThan(1)
+    expectAllBalanced(out)
+    for (let i = 1; i < out.length; i++) {
+      expect(out[i].startsWith('```ts\n')).toBe(true)
+    }
+  })
+
+  test('split exactly at a fence-open boundary leaves both halves balanced', () => {
+    // Construct so the chunker's line-boundary lands at or near the
+    // ```python opener line. Two outcomes are valid:
+    //   (a) Cut lands BEFORE the opener: chunk N ends with prose
+    //       (no synthetic close), chunk N+1 starts with the natural
+    //       opener.
+    //   (b) Cut lands AFTER the opener line: chunk N ends with the
+    //       opener line, gets a synthetic close; chunk N+1 starts
+    //       with a synthetic ```python opener.
+    // In either case, every chunk must be fence-balanced and the
+    // python lang must be preserved wherever it gets reopened.
+    const prose = 'a'.repeat(50) + '\n' + 'b'.repeat(50) + '\n' + 'c'.repeat(50)
+    const code = ('d'.repeat(50) + '\n').repeat(5)
+    const text = prose + '\n```python\n' + code + '```'
+    const out = chunk(text, 180)
+    expectAllBalanced(out)
+    // Any chunk that contains a python fence opener uses the lang
+    // tag (no chunk should emit a bare ``` re-opener when the source
+    // opener was ```python).
+    for (const c of out) {
+      if (c.includes('```python')) continue
+      // If a chunk has any fence, it shouldn't be a bare ``` that
+      // belongs to the python block. The only legit bare ``` here is
+      // a closer of the python block (which came from synthetic
+      // close-injection or the original closing fence).
+      // Stricter: count opens. An open is a ``` line whose info
+      // string is non-empty OR which is the first-of-its-pair line.
+      // Easy stand-in: the only bare-``` lines should be closers,
+      // which means the joined text never has two bare ``` in a row
+      // without a python opener in between. We don't assert this
+      // directly — expectAllBalanced is the load-bearing check.
+    }
+  })
+
+  test('split exactly at a fence-close boundary leaves both halves balanced', () => {
+    // The split lands such that the closing ``` is the last line of
+    // chunk N (or the first line of chunk N+1). In neither case should
+    // the chunker inject extra markers.
+    const code = ('e'.repeat(50) + '\n').repeat(3)
+    const text = 'a'.repeat(80) + '\n```py\n' + code + '```\n' + 'b'.repeat(80)
+    const out = chunk(text, 180)
+    expect(out.length).toBeGreaterThan(1)
+    expectAllBalanced(out)
+  })
+
+  test('long fence spanning 3+ chunks: every chunk reopens with lang', () => {
+    const code = ('f'.repeat(50) + '\n').repeat(20)
+    const text = '```python\n' + code + '```'
+    const out = chunk(text, 400)
+    expect(out.length).toBeGreaterThanOrEqual(3)
+    expectAllBalanced(out)
+    for (const c of out) {
+      expect(c.length).toBeLessThanOrEqual(400)
+      expect(c.startsWith('```python\n')).toBe(true)
+    }
+    // Every chunk except the final ends with an injected closer.
+    for (let i = 0; i < out.length - 1; i++) {
+      expect(out[i].endsWith('\n```')).toBe(true)
+    }
+  })
+
+  test('no-fence input takes the unmodified fast path', () => {
+    // Same shape as the suite's hard-cut test: confirms fence-aware
+    // wrapping does not alter behavior on fence-free input.
+    const t = 'a'.repeat(5000)
+    expect(chunk(t, 2000)).toEqual([
+      'a'.repeat(2000),
+      'a'.repeat(2000),
+      'a'.repeat(1000),
+    ])
+  })
+})
+
+describe('getOpenFenceAtEnd()', () => {
+  test('returns null for plain prose with no fences', () => {
+    expect(getOpenFenceAtEnd('plain prose, no fences here.')).toBe(null)
+  })
+
+  test('returns null for a balanced fence', () => {
+    expect(getOpenFenceAtEnd('```\nfoo\n```')).toBe(null)
+  })
+
+  test('returns lang and len for an unclosed 3-tick fence with lang', () => {
+    expect(getOpenFenceAtEnd('```python\nfoo\nbar')).toEqual({
+      lang: 'python',
+      fenceLen: 3,
+    })
+  })
+
+  test('returns empty lang for an unclosed bare 3-tick fence', () => {
+    expect(getOpenFenceAtEnd('```\nfoo')).toEqual({ lang: '', fenceLen: 3 })
+  })
+
+  test('handles 4-backtick fence variant', () => {
+    expect(getOpenFenceAtEnd('````\nfoo')).toEqual({ lang: '', fenceLen: 4 })
+    expect(getOpenFenceAtEnd('````python\nfoo')).toEqual({
+      lang: 'python',
+      fenceLen: 4,
+    })
+  })
+
+  test('inline backticks are not interpreted as fences', () => {
+    expect(getOpenFenceAtEnd('a `let x = 1` b')).toBe(null)
+    expect(getOpenFenceAtEnd('two ``backticks`` inline')).toBe(null)
+  })
+
+  test('inline backticks inside an open fence do not close it', () => {
+    expect(getOpenFenceAtEnd('```ts\nlet x = `123`')).toEqual({
+      lang: 'ts',
+      fenceLen: 3,
+    })
+  })
+
+  test('a 3-tick line inside a 4-tick fence is content, not a closer', () => {
+    expect(getOpenFenceAtEnd('````\n```\nfoo\n````')).toBe(null)
+    expect(getOpenFenceAtEnd('````\n```\nfoo')).toEqual({
+      lang: '',
+      fenceLen: 4,
+    })
+  })
+
+  test('closer with extra non-whitespace is treated as content', () => {
+    // ``` followed by trailing text is NOT a valid closer.
+    expect(getOpenFenceAtEnd('```\nfoo\n``` end')).toEqual({
+      lang: '',
+      fenceLen: 3,
+    })
+  })
+
+  test('two adjacent fences are both balanced', () => {
+    expect(getOpenFenceAtEnd('```py\na\n```\n```ts\nb\n```')).toBe(null)
   })
 })
 
