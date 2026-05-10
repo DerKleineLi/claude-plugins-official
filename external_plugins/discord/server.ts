@@ -875,11 +875,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const access = loadAccess()
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const replyMode = access.replyToMode ?? 'first'
-        // buildReplyMessages handles three cases: plain prose (line/word-aware
-        // chunking), prose with small tables (in-place fenced wrap), and prose
-        // with a >1900-char table (multi-message split with header repeated, or
-        // .md attachment fallback if a single row alone overflows).
-        const messages = buildReplyMessages(text, limit)
+        // buildReplyMessages walks the reply text into prose/table/formula/code
+        // elements; non-prose elements ship as their own attachment-only
+        // message (PNG + source for tables/formulas, single source file for
+        // code blocks with a known lang tag). Prose runs through the
+        // fence-aware chunker.
+        const messages = await buildReplyMessages(text, limit)
         const sentIds: string[] = []
 
         try {

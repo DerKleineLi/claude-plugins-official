@@ -2,39 +2,36 @@
 // No I/O — kept separate from server.ts so it's unit-testable without
 // launching the gateway. Tested in tests/format.test.ts.
 //
-// Pipeline (caller side, see buildReplyMessages below):
-//   1. detectOversizedTable — find first table whose wrapped size
-//      exceeds the multi-message threshold. If found, the caller hands
-//      it to splitTableIntoMessages, which emits one fenced code-block
-//      per message (each with the original header + separator) and
-//      falls back to a .md attachment if a single row alone exceeds
-//      the per-message budget.
-//   2. Otherwise, wrapPipeTablesAsCodeBlocks fence-wraps any pipe
-//      tables in place — Discord's client doesn't render `|` markdown,
-//      but a fenced block is monospace and preserves column alignment.
-//   3. chunk splits the (possibly wrapped) text on the safest available
-//      boundary: paragraph > line > word > hard-cut.
+// Pipeline (see buildReplyMessages below):
+//   1. parseElements walks the input text and breaks it into prose,
+//      table, formula, and code elements. Detection order in the
+//      parser ensures fenced code blocks are claimed first (so an
+//      inner table or `$$…$$` doesn't escape).
+//   2. Each non-prose element renders to a separate Discord message
+//      that carries only file attachments (PNG + source) — Discord's
+//      inline preview pane shows them with syntax highlighting for
+//      .md / .tex / language-extension files, and the PNG is the
+//      always-visible artifact for tables and formulas.
+//   3. Prose between elements is split with the existing fence-aware
+//      chunker (paragraph > line > word > hard-cut, with synthetic
+//      open/close pairs around fences that straddle a boundary).
+//
+// On per-element render failure: tables fall back to .md-only;
+// formulas fall back to an inline ```tex code block; code blocks with
+// an unrecognized language tag are kept inline by the parser itself.
+//
+// MAX_ATTACHMENT_BYTES (10 MB) is a defensive cap matched to
+// server.ts's cap; an oversized buffer falls back to inline.
 
 import { AttachmentBuilder } from 'discord.js'
+import { parseElements } from './parse_elements'
+import { renderMarkdownTableToPng } from './render_table'
+import { renderFormulaToPng } from './render_formula'
 
 export const MAX_CHUNK_LIMIT = 2000
-export const TABLE_MULTI_MESSAGE_THRESHOLD = 1900
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 
 const TABLE_SEP_RE = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$/
-const PROTECT_RE = /__DISCORD_CB_(\d+)__/g
-
-function protectCodeBlocks(text: string): { protected: string; blocks: string[] } {
-  const blocks: string[] = []
-  const protectedText = text.replace(/```[\s\S]*?```/g, m => {
-    blocks.push(m)
-    return `__DISCORD_CB_${blocks.length - 1}__`
-  })
-  return { protected: protectedText, blocks }
-}
-
-function restoreCodeBlocks(text: string, blocks: string[]): string {
-  return text.replace(PROTECT_RE, (_, n) => blocks[Number(n)])
-}
 
 // Parse a single table row line into trimmed cells. Strips one leading
 // and one trailing empty cell if the line had surrounding `|` (the
@@ -137,52 +134,6 @@ export function findTablesInLines(lines: string[]): { start: number; end: number
     i++
   }
   return out
-}
-
-// Wrap every pipe-table in `text` in plain ```...``` fences. Each table
-// is column-width-normalized first (so monospace rendering inside the
-// fence shows aligned columns). Pre-existing fenced code blocks are
-// protected from double-wrapping (a stray `|` in a code block won't
-// trigger detection).
-export function wrapPipeTablesAsCodeBlocks(text: string): string {
-  const { protected: prot, blocks } = protectCodeBlocks(text)
-  const lines = prot.split('\n')
-  const tables = findTablesInLines(lines)
-  if (tables.length === 0) return text
-
-  // Walk back-to-front so earlier (start, end) ranges stay valid.
-  for (let k = tables.length - 1; k >= 0; k--) {
-    const { start, end } = tables[k]
-    const tableBlock = lines.slice(start, end).join('\n')
-    const normalized = normalizeTableWidths(tableBlock).split('\n')
-    lines.splice(start, end - start, '```', ...normalized, '```')
-  }
-  return restoreCodeBlocks(lines.join('\n'), blocks)
-}
-
-// Find the FIRST table in `text` whose wrapped size exceeds `threshold`.
-// Returns the raw (unwrapped) table block plus the prose around it,
-// or null. Wraps the search in code-block protection so a `|` row
-// inside a pre-existing fence doesn't masquerade as a table.
-export function detectOversizedTable(
-  text: string,
-  threshold: number,
-): { pre: string; table: string; post: string } | null {
-  const { protected: prot, blocks } = protectCodeBlocks(text)
-  const lines = prot.split('\n')
-  const tables = findTablesInLines(lines)
-
-  for (const { start, end } of tables) {
-    const tableLines = lines.slice(start, end)
-    const tableBlock = tableLines.join('\n')
-    // Fence overhead is ```\n at start (4) + \n``` at end (4) = 8.
-    if (tableBlock.length + 8 > threshold) {
-      const pre = restoreCodeBlocks(lines.slice(0, start).join('\n'), blocks)
-      const post = restoreCodeBlocks(lines.slice(end).join('\n'), blocks)
-      return { pre, table: tableBlock, post }
-    }
-  }
-  return null
 }
 
 // Line-/word-aware splitter. Hierarchy of preferred split points (latest
@@ -316,116 +267,111 @@ function injectFenceMarkers(chunks: string[]): string[] {
 
 export type OutboundMessage = { content: string; files?: AttachmentBuilder[] }
 
-// Render an oversized table across multiple messages. Each message is a
-// stand-alone fenced code block beginning with the original header +
-// separator (so it reads as a valid table on its own). Continuation
-// messages (k > 1 of N) are prefixed with `_continued (k/N)_` on a line
-// above the fence.
-//
-// If a single row's length exceeds the per-message budget, falls back
-// to attaching the raw markdown as `table.md` with a one-line summary.
-// Pre/post prose, if any, is chunked separately and ordered around the
-// table messages.
-export function splitTableIntoMessages(
-  pre: string,
-  tableBlock: string,
-  post: string,
-  tableThreshold: number,
-  chunkLimit: number,
-): OutboundMessage[] {
-  // Normalize widths over the FULL table once, so every emitted chunk
-  // shares the same column widths (rather than each chunk re-deriving
-  // widths from its own row subset, which would give jagged alignment
-  // between consecutive messages).
-  const normalized = normalizeTableWidths(tableBlock)
-  const lines = normalized.split('\n')
-  if (lines.length < 3) {
-    return chunk([pre, normalized, post].filter(Boolean).join('\n').trim(), chunkLimit).map(
-      c => ({ content: c }),
-    )
+// Wrap a render call so a thrown error is logged once and surfaces as
+// null to the caller — keeps a per-element render failure from breaking
+// the whole reply.
+async function tryRender(fn: () => Promise<Buffer | null>): Promise<Buffer | null> {
+  try {
+    return await fn()
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    process.stderr.write(`[discord/format] render failed: ${msg}\n`)
+    return null
   }
-  const header = lines[0]
-  const separator = lines[1]
-  const rows = lines.slice(2)
-
-  // Per-chunk body shape:
-  //   [marker]```\nheader\nseparator\nrow0\n...\nrowM-1\n```
-  // Length = marker + 9 + header + separator + sum(rowLens) + numRows
-  // Reserve 25 chars for the worst-case continuation marker (the actual
-  // marker `_continued (kk/NN)_\n` is 22; pad to 25).
-  const markerReserve = 25
-  const fixedNonRowOverhead = header.length + separator.length + 9
-  const rowsBudget = tableThreshold - markerReserve - fixedNonRowOverhead
-
-  const longestRow = rows.length > 0 ? Math.max(...rows.map(r => r.length)) : 0
-  if (longestRow + 1 > rowsBudget) {
-    // Single-row overflow → attachment fallback for the table itself.
-    // Pre/post prose still gets sent inline. We attach the normalized
-    // version (already aligned) since that's what we've been working
-    // with — same content, nicer-looking in Discord's .md preview.
-    const buf = Buffer.from(normalized, 'utf-8')
-    const attachment = new AttachmentBuilder(buf, { name: 'table.md' })
-    const preMsgs = pre.trim()
-      ? chunk(pre.trim(), chunkLimit).map(c => ({ content: c }))
-      : []
-    const postMsgs = post.trim()
-      ? chunk(post.trim(), chunkLimit).map(c => ({ content: c }))
-      : []
-    return [
-      ...preMsgs,
-      {
-        content: 'Table too large to render inline (single row exceeds the limit). See attachment.',
-        files: [attachment],
-      },
-      ...postMsgs,
-    ]
-  }
-
-  // Greedy pack rows into per-chunk groups within rowsBudget.
-  const rowChunks: string[][] = []
-  let current: string[] = []
-  let currentSize = 0
-  for (const row of rows) {
-    const cost = row.length + 1
-    if (currentSize + cost > rowsBudget && current.length > 0) {
-      rowChunks.push(current)
-      current = []
-      currentSize = 0
-    }
-    current.push(row)
-    currentSize += cost
-  }
-  if (current.length > 0) rowChunks.push(current)
-
-  const N = rowChunks.length
-  const tableMessages: OutboundMessage[] = rowChunks.map((rs, k) => {
-    const marker = k > 0 ? `_continued (${k + 1}/${N})_\n` : ''
-    const body = `${marker}\`\`\`\n${header}\n${separator}\n${rs.join('\n')}\n\`\`\``
-    return { content: body }
-  })
-
-  const preMsgs = pre.trim()
-    ? chunk(pre.trim(), chunkLimit).map(c => ({ content: c }))
-    : []
-  const postMsgs = post.trim()
-    ? chunk(post.trim(), chunkLimit).map(c => ({ content: c }))
-    : []
-  return [...preMsgs, ...tableMessages, ...postMsgs]
 }
 
-// Top-level convenience: route input text into the appropriate render
-// pipeline. Returns an array of {content, files?} ready for ch.send.
-export function buildReplyMessages(text: string, chunkLimit: number): OutboundMessage[] {
-  const oversize = detectOversizedTable(text, TABLE_MULTI_MESSAGE_THRESHOLD)
-  if (oversize) {
-    return splitTableIntoMessages(
-      oversize.pre,
-      oversize.table,
-      oversize.post,
-      TABLE_MULTI_MESSAGE_THRESHOLD,
-      chunkLimit,
-    )
+function attachmentFromBuffer(buf: Buffer, name: string): AttachmentBuilder | null {
+  if (buf.length === 0 || buf.length > MAX_ATTACHMENT_BYTES) return null
+  return new AttachmentBuilder(buf, { name })
+}
+
+// Internal: same as buildReplyMessages but accepts injected renderers,
+// so tests can stub PNG render to throw without monkey-patching modules.
+export async function buildReplyMessagesWith(
+  text: string,
+  chunkLimit: number,
+  renderTable: (md: string) => Promise<Buffer | null>,
+  renderFormula: (tex: string) => Promise<Buffer>,
+): Promise<OutboundMessage[]> {
+  const elements = parseElements(text)
+  const out: OutboundMessage[] = []
+  let tableIdx = 0
+  let formulaIdx = 0
+  let codeIdx = 0
+
+  const pushProse = (raw: string) => {
+    const trimmed = raw.replace(/^\s+|\s+$/g, '')
+    if (!trimmed) return
+    for (const c of chunk(trimmed, chunkLimit)) out.push({ content: c })
   }
-  const formatted = wrapPipeTablesAsCodeBlocks(text)
-  return chunk(formatted, chunkLimit).map(c => ({ content: c }))
+
+  for (const el of elements) {
+    if (el.kind === 'prose') {
+      pushProse(el.text)
+      continue
+    }
+    if (el.kind === 'table') {
+      tableIdx++
+      const png = await tryRender(() => renderTable(el.mdSource))
+      const files: AttachmentBuilder[] = []
+      if (png) {
+        const a = attachmentFromBuffer(png, `table-${tableIdx}.png`)
+        if (a) files.push(a)
+      }
+      const mdBuf = Buffer.from(normalizeTableWidths(el.mdSource), 'utf8')
+      const mdAtt = attachmentFromBuffer(mdBuf, `table-${tableIdx}.md`)
+      if (mdAtt) files.push(mdAtt)
+      if (files.length > 0) out.push({ content: '', files })
+      continue
+    }
+    if (el.kind === 'formula') {
+      formulaIdx++
+      const png = await tryRender(() => renderFormula(el.texSource))
+      if (png) {
+        const pngAtt = attachmentFromBuffer(png, `formula-${formulaIdx}.png`)
+        const texAtt = attachmentFromBuffer(
+          Buffer.from(el.texSource, 'utf8'),
+          `formula-${formulaIdx}.tex`,
+        )
+        const files: AttachmentBuilder[] = []
+        if (pngAtt) files.push(pngAtt)
+        if (texAtt) files.push(texAtt)
+        if (files.length > 0) {
+          out.push({ content: '', files })
+          continue
+        }
+      }
+      // Fallback: inline ```tex code-block of the source. Better than a
+      // bare .tex with no visible context.
+      pushProse('```tex\n' + el.texSource + '\n```')
+      continue
+    }
+    // el.kind === 'code'
+    codeIdx++
+    const buf = Buffer.from(el.source, 'utf8')
+    const att = attachmentFromBuffer(buf, `code-${codeIdx}.${el.ext}`)
+    if (att) {
+      out.push({ content: '', files: [att] })
+    } else {
+      // Defensive: oversized code block falls back to inline. Keeps
+      // the bot useful instead of dropping the content entirely.
+      pushProse('```' + el.lang + '\n' + el.source + '\n```')
+    }
+  }
+  return out
+}
+
+// Top-level: route input text into the element-attachment pipeline.
+// Each table/formula/code element becomes its own attachment-only
+// message; prose runs through the fence-aware chunker.
+export async function buildReplyMessages(
+  text: string,
+  chunkLimit: number = MAX_CHUNK_LIMIT,
+): Promise<OutboundMessage[]> {
+  return buildReplyMessagesWith(
+    text,
+    chunkLimit,
+    renderMarkdownTableToPng,
+    renderFormulaToPng,
+  )
 }
