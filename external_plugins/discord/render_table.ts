@@ -120,6 +120,42 @@ function visibleLen(s: string): number {
   return s.replace(/\*\*?|`/g, '').length
 }
 
+// Approximates satori's word-wrap behavior: greedily fits words into a
+// colChars-wide column, breaking at every space where the next word
+// would overflow. Returns the resulting line count.
+//
+// Why not the naive `Math.ceil(naked / colWidth)`: that heuristic counts
+// 7-char "Pure JS" in a 7-char column as 1 line, but satori wraps at
+// the space when actual rendered glyph widths exceed the
+// 7-char × 7.5-px-per-char budget. The naive count under-estimated row
+// height and the last row got clipped under the SVG `height`. The
+// +24 slack at the bottom of buildTree is the matching safety margin
+// when a tight near-overflow case fools the per-word simulation too.
+//
+// A word longer than colWidth still occupies (at least) one line — we
+// don't break inside a word. Multi-word cells with tight fits return
+// the same line count as the char-density heuristic; ragged cells
+// (long words separated by spaces) get a more accurate count.
+function countWrappedLines(cell: string, colWidth: number): number {
+  const visible = cell.replace(/\*\*?|`/g, '')
+  const words = visible.split(/\s+/).filter(Boolean)
+  if (words.length === 0) return 1
+  let lines = 1
+  let curLen = 0
+  for (const word of words) {
+    const wordLen = word.length
+    if (curLen === 0) {
+      curLen = wordLen
+    } else if (curLen + 1 + wordLen <= colWidth) {
+      curLen += 1 + wordLen
+    } else {
+      lines++
+      curLen = wordLen
+    }
+  }
+  return lines
+}
+
 // Adaptive column widths: start at the natural max-cell-width per column.
 // If the row is wider than maxTotalChars, shave the widest column by 1
 // each pass until we fit (or every column is at the floor of 12).
@@ -192,20 +228,25 @@ function buildTree(
     width: widthPx,
   }, [rowNode(header, true), ...rows.map((r, i) => rowNode(r, false, i % 2 === 1))])
 
-  // Height estimate: per row, max wrapped-line count across cells. Plus
-  // vertical padding once per row, plus row borders. The +6 is slack so
-  // line-height rounding never clips the last row (Satori truncates
-  // content past its `height`).
+  // Height estimate: per row, max wrapped-line count across cells. Uses
+  // word-aware wrap simulation (countWrappedLines) instead of naive
+  // char-density division — the naive version under-counted "Pure JS"
+  // (7 chars in a 7-char column) as 1 line when satori actually wrapped
+  // it to 2 visual lines because real glyph widths exceeded the
+  // CHAR_PX × colChars px budget. Plus vertical padding once per row,
+  // plus row borders. The +24 slack (≈1 line at LINE_PX=20) is the
+  // belt-and-suspenders margin for tight near-overflow cases that the
+  // simulation might still miss (e.g. exact-fit on word boundary that
+  // satori still wraps due to kerning/anti-aliasing).
   let totalContentPx = 0
   for (const r of [header, ...rows]) {
-    const lines = r.map((cell, c) => {
-      const naked = visibleLen(cell)
-      return Math.max(1, Math.ceil(naked / Math.max(colChars[c], 1)))
-    })
+    const lines = r.map((cell, c) =>
+      countWrappedLines(cell, Math.max(colChars[c], 1)),
+    )
     const maxLines = Math.max(...lines)
     totalContentPx += maxLines * LINE_PX + PAD_Y * 2 + 1
   }
-  const heightEstPx = Math.ceil(totalContentPx + 6)
+  const heightEstPx = Math.ceil(totalContentPx + 24)
 
   return { root, widthPx, heightEstPx }
 }
