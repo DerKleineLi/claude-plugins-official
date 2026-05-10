@@ -23,16 +23,34 @@ This unification (bare MCP server + `--plugin-dir`, no marketplace) was settled 
 - **2026-05-08** — Forward `reply_to_message_id` (and `reply_to_user`/`reply_to_user_id`/`reply_to_text`) on inbound channel blocks. Parity with telegram fork commit `bfeb345`.
 - **2026-05-08** — Forward emoji reactions (`messageReactionAdd`/`Remove` → `<channel … reaction="…">` block). Parity with telegram fork commit `c90b380`.
 - **2026-05-08** — Channel inspection: `get_channel` (read-only) returns full metadata as JSON, including forum `available_tags` with their server-assigned IDs. `modify_channel` now also returns the full updated state in its response, so creating a tag and applying it to a post is a 2-call sequence (modify → start_forum_post with `applied_tags`) instead of 3 (modify → get → start_forum_post).
-- **2026-05-08** — Reply-rendering pipeline (`format.ts`, new module). Four user-visible changes, applied to every outbound `reply` call:
-  1. **Smart chunker.** Hierarchy: paragraph (`\n\n`) → line (`\n`) → word (space) → hard cut. Never splits mid-word unless a single word exceeds the limit; never splits mid-line unless a single line does. The legacy `chunkMode` config field (`'length'` | `'newline'`) is deprecated and silently ignored on read; one mode now.
-  2. **Pipe-table → fenced code block.** Discord's client does not render `|`-table markdown ([open feature request](https://support.discord.com/hc/en-us/community/posts/16131946321815)) — `wrapPipeTablesAsCodeBlocks` detects header + `:?-+:?` separator + ≥1 data rows and wraps the block in plain ` ``` `. Pre-existing fenced code blocks are protected from double-wrapping. Pipe-count check on data rows prevents the table from extending into prose that contains a stray `|`. Tables are column-width-normalized via `normalizeTableWidths` before fencing — every cell is `padEnd`'d to its column's max width (min 3) so the monospace render shows aligned columns. Alignment-marker colons in the separator row are preserved positionally; data rows are uniformly left-aligned regardless of `:---` / `---:` markers (the colon is a hint, not enforced in monospace).
-     - **Wide-char caveat:** `.length` counts UTF-16 code units, not display columns. CJK characters and most emoji occupy two display cells but `.length` 1, so a row with wide chars will visually misalign by one cell per occurrence. We accept this rather than pulling in a wide-char display-width library; the alignment is correct for ASCII and degrades gracefully for everything else.
-  3. **Multi-message table split.** When a wrapped table would exceed 1900 chars, `splitTableIntoMessages` packs rows greedily across multiple sends, each one a stand-alone fenced block beginning with the original header + separator. Continuation messages (k > 1) are prefixed with `_continued (k/N)_` on a line above the fence. Column widths are computed once over the **full** table (not per-chunk) so every chunk shares the same widths and consecutive messages line up.
-  4. **`.md` attachment fallback.** When a single row alone exceeds the per-message row budget, the (normalized) table is sent as a `table.md` buffer attachment with a one-line summary in `content`. Pre/post prose around the table is still sent inline.
+- **2026-05-08** — Reply-rendering pipeline (`format.ts`, new module). Pure helpers; no I/O.
+  1. **Smart chunker** (`chunk`). Hierarchy: paragraph (`\n\n`) → line (`\n`) → word (space) → hard cut. Never splits mid-word unless a single word exceeds the limit; never splits mid-line unless a single line does. The legacy `chunkMode` config field (`'length'` | `'newline'`) is deprecated and silently ignored on read.
+  2. **Fence preservation across boundaries** (`getOpenFenceAtEnd` + `injectFenceMarkers`, added 2026-05-09). When a chunk boundary falls inside an open fence, a synthetic closer is appended to the chunk before and the matching opener (with the original lang tag and backtick count) is prepended to the chunk after. The per-chunk limit is reduced by `FENCE_RESERVE` (64 chars) so injected markers fit. 4-backtick fences nest 3-backtick fences correctly.
 
-  Side: `MAX_ATTACHMENT_BYTES` was lowered 25 → 10 MB to match Discord's 2024 free-tier cap (the old value would let oversize files through `assertSendable` only to be rejected by Discord's API).
+  Side: `MAX_ATTACHMENT_BYTES` was lowered 25 → 10 MB (server.ts) to match Discord's 2024 free-tier cap.
 
-  Pure helpers live in `format.ts` (no I/O); unit-tested via `bun test tests/format.test.ts`.
+- **2026-05-10** — **Element-attachment pipeline** (replaces the original wrap-table-as-codeblock approach). The user found that Discord's client renders `.txt`/`.md`/`.csv`/`.tex` and most source-code extensions inline with syntax highlighting in its file-preview pane — same UX as a fenced code block, but searchable, copyable, scrollable, and not subject to the 2000-char message limit.
+
+  **Pipeline shape** (`buildReplyMessages` → `parseElements` → renderers):
+  1. `parse_elements.ts` walks the reply text in three passes — fenced code blocks first (highest priority, so an inner table or `$$…$$` doesn't escape), then pipe-tables (line-oriented, masked against in-code lines), then display formulas (positional regex, skipping any character range claimed by an earlier pass). Anything between recognized elements is `prose`. Adjacent prose elements are coalesced.
+  2. `buildReplyMessages` (now async) emits one `OutboundMessage` per element. Prose runs through the fence-aware chunker (case 1+2 above). Each non-prose element gets its own attachment-only message (`{content: '', files: [...]}`) immediately following its prose context — Discord renders this as a separate timeline entry that the inline-preview / lightbox UI handles.
+
+  **What ships per element:**
+  - **Pipe-tables** → `table-N.png` (satori → SVG → resvg-js, dark theme, adaptive column widths) **+** `table-N.md` (column-normalized via `normalizeTableWidths` so the source is also pretty). PNG is the always-visible artifact; `.md` is searchable/copyable.
+  - **Display formulas** (`$$…$$`, `\[…\]`, `\begin{equation|equation*|align|align*|aligned|gather|gather*|multline|multline*}…\end{…}`) → `formula-N.png` (mathjax-full → SVG → resvg-js; `currentColor` rewritten to white; dark `#2c2f33` background) **+** `formula-N.tex` (raw source). Inline `$…$` math stays inside prose by design.
+  - **Fenced code blocks with a known lang tag** → single `code-N.<ext>` file (`lang_extensions.ts` maps highlight.js v10.6.0 lang IDs + common aliases to canonical extensions). Discord shows it with proper syntax highlighting in the preview pane. The fence markers are stripped — the file holds only the inner source. Code blocks with **no** lang tag or an **unrecognized** one stay inline as a fenced code block (the parser re-emits the original fence as prose).
+
+  **Failure modes** (per-element try/catch, never breaks the whole reply):
+  - Table PNG render fails → emit `.md` attachment alone (split still happens).
+  - Formula PNG render fails → fall back to inline ` ```tex ` code-block of the source. (Bare `.tex` with no visible context would be worse than an inline block.)
+  - Code block — no rendering, only extension lookup; unknown lang already stays inline.
+  - Buffer > `MAX_ATTACHMENT_BYTES` (10 MB) → fall back to inline. Defensive only; chat-reply elements rarely approach this.
+
+  **Renderers** are pure modules: `render_table.ts` (satori + resvg-js, vendors DejaVu Sans/Sans-Bold/Sans-Mono under `fonts/`), `render_formula.ts` (mathjax-full + resvg-js, MathJax adapter cached at module scope). Both are imported by `format.ts`; the production `buildReplyMessages` calls them directly. Tests inject stub renderers via `buildReplyMessagesWith` to exercise the pipeline deterministically without spinning up satori/mathjax.
+
+  **What was removed:** `wrapPipeTablesAsCodeBlocks`, `splitTableIntoMessages`, `detectOversizedTable`, `TABLE_MULTI_MESSAGE_THRESHOLD` — the multi-message table split, fenced-codeblock wrapping, and oversized-table detection are all subsumed by the file-attach approach (no per-message size limit on the `.md` attachment).
+
+  Tested via `bun test tests/` — `tests/elements.test.ts` covers the parser, `tests/format.test.ts` covers the chunker + buildReplyMessages routing.
 
 ## Architecture rationale
 
