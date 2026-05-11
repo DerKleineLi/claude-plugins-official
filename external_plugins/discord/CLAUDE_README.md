@@ -58,6 +58,8 @@ This unification (bare MCP server + `--plugin-dir`, no marketplace) was settled 
 
 - **2026-05-11** — **Single-word overflow** in `countWrappedLines` (A1.2). The original "single-word = 1 line" floor (no break inside a word, so any word longer than the column was reported as 1 line) under-counted satori's actual wrap. Concrete failure: bold `**post-A+G**` in a width-8 column scales to 9 virtual chars (`ceil(8 × 1.10)`), exceeds colWidth, satori wraps to 2 visual lines, but the simulator returned 1 — leaving the row clipped even after A1. Fix: when curLen ends up > colWidth, charge `ceil(curLen / colWidth)` lines total and carry the remainder forward so subsequent words on the same line land on the wrapped tail rather than overlapping it. Strictly additive — never reports fewer lines than the pre-A1.2 formula. Bumped fixture height 192 → 212 px.
 
+- **2026-05-11** — `list_threads` read-only forum-post enumeration tool. Wraps discord.js `ForumChannel.threads.fetchActive()` (guild-wide endpoint, filtered to the forum by parent_id in `_mapThreads`) and `fetchArchived({type:'public', before})` (paginated, 100/page, 50-page cap). Server-side `applied_tag_filter` and `include_archived` flags. Not gated on `mgmtEnabled` — pure read, composes with the always-on `get_channel`. Returns a `ThreadSummary[]` shape that's a strict subset of `channelStateJson`. See `Tool reference (read-only, no gate)` below.
+
 ## Architecture rationale
 
 Single-user, single-server, private bot. Trust model:
@@ -97,9 +99,17 @@ Privileged Gateway Intents in use:
 
 `inspection`: `get_channel` (read-only metadata for any channel, including forum `available_tags` with IDs), `get_audit_log` (filter by user/action/before).
 
+## Tool reference (read-only, no gate)
+
+`list_threads` (added 2026-05-11): enumerate forum-post threads in a forum channel. Returns an array of `ThreadSummary {id, name, applied_tags, archived, locked, auto_archive_duration, message_count, member_count, parent_id, rate_limit_per_user}`. Supports `applied_tag_filter` (single tag ID — server-side filter) and `include_archived` (default false; paginates archived public threads via `before` cursor under a 50-page cap). Active threads sorted by id desc (newest creation first), archived in Discord's native archived-time-desc order. Not gated on `mgmtEnabled` — composes with the always-on `get_channel` and the parent's `fetch_messages` path; the parent calls `get_channel` on a specific thread id for additional detail.
+
+Canonical workflow for forum discovery: `list_threads(forum_id)` → pick a thread id → `get_channel(thread_id)` for full state, then `fetch_messages(thread_id)` for content.
+
 The 2-call "create-then-apply" pattern for forum tags:
 1. `modify_channel` with `available_tags: [{name: "bug"}]` — response carries the new tag's `id`.
 2. `start_forum_post` with `applied_tags: ["<id from step 1>"]`.
+
+Enumerate posts already tagged with a known tag id: `list_threads(forum_id, applied_tag_filter: "<tag_id>")`.
 
 ## How to extend
 

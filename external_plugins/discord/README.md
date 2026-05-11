@@ -97,6 +97,7 @@ Quick reference: IDs are Discord **snowflakes** (numeric — enable Developer Mo
 | `edit_message` | Edit a message the bot previously sent. Useful for "working…" → result progress updates. Only works on the bot's own messages. |
 | `fetch_messages` | Pull recent history from a channel (oldest-first). Capped at 100 per call. Each line includes the message ID so the model can `reply_to` it; messages with attachments are marked `+Natt`. Discord's search API isn't exposed to bots, so this is the only lookback. |
 | `download_attachment` | Download all attachments from a specific message by ID to `~/.claude/channels/discord/inbox/`. Returns file paths + metadata. Use when `fetch_messages` shows a message has attachments. |
+| `list_threads` | Enumerate forum-post threads in a forum channel. Returns `{id, name, applied_tags, archived, locked, …}` per thread. Supports `applied_tag_filter` (single tag ID) and `include_archived` (default false, paginated). Read-only — pair with `get_channel(thread_id)` for full detail. |
 
 Inbound messages trigger a typing indicator automatically — Discord shows
 "botname is typing…" while the assistant works on a response.
