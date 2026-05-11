@@ -136,14 +136,31 @@ function visibleLen(s: string): number {
 // don't break inside a word. Multi-word cells with tight fits return
 // the same line count as the char-density heuristic; ragged cells
 // (long words separated by spaces) get a more accurate count.
-function countWrappedLines(cell: string, colWidth: number): number {
-  const visible = cell.replace(/\*\*?|`/g, '')
-  const words = visible.split(/\s+/).filter(Boolean)
-  if (words.length === 0) return 1
+//
+// **Markup awareness** (2026-05-11): the simulator now inflates a
+// word's virtual char count to account for inline-markup render width:
+//   - Each backtick in a code span renders with 4 px horizontal padding
+//     via `inlineMd`. Two backticks per span × ~4 px ≈ +1 virtual char
+//     at CHAR_PX=7.5, so we just add the backtick count to the visible
+//     length.
+//   - Bold runs (`**…**`) render at ~1.10× the glyph stride of regular
+//     weight; we scale the word's virtual length accordingly.
+// Without this, header cells like "`vis_a` since `a`" in a 13-char
+// column estimate to 1 line but satori wraps them to 2. Fixture:
+// tests/fixtures/post_a_plus_g_table.md.
+export function countWrappedLines(cell: string, colWidth: number): number {
+  const wordsRaw = cell.split(/\s+/).filter(Boolean)
+  if (wordsRaw.length === 0) return 1
+  const wordsVirtual = wordsRaw.map(w => {
+    const codeBackticks = (w.match(/`/g) || []).length
+    const visible = w.replace(/\*\*?|`/g, '').length
+    const hasBold = w.includes('**')
+    const len = visible + codeBackticks
+    return Math.ceil(hasBold ? len * 1.1 : len)
+  })
   let lines = 1
   let curLen = 0
-  for (const word of words) {
-    const wordLen = word.length
+  for (const wordLen of wordsVirtual) {
     if (curLen === 0) {
       curLen = wordLen
     } else if (curLen + 1 + wordLen <= colWidth) {
