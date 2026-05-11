@@ -122,6 +122,27 @@ describe('countWrappedLines() — no over-estimate on plain text', () => {
   })
 })
 
+describe('renderMarkdownTableToPng() — auto-height canvas (A1.4)', () => {
+  // The brief's verbatim 5-row test table (live-Discord fixture).
+  // Pre-A1.4: canvas was 749 × 346 (countWrappedLines simulator +24
+  // px slack, leaving ~30 px of unused space below the last row).
+  // Post-A1.4: satori computes its own layout height via
+  // `height: undefined`; canvas matches the row stack exactly.
+  test('list_threads_overflow_table.md renders with canvas matching actual content', async () => {
+    const md = readFileSync(join(FIXTURES_DIR, 'list_threads_overflow_table.md'), 'utf8')
+    const png = await renderMarkdownTableToPng(md)
+    expect(png).not.toBeNull()
+    const { width, height } = pngDims(png as Buffer)
+    expect(width).toBe(749)
+    // Pre-A1.4 height was 346 (slack-padded). Post-A1.4 height is
+    // exactly satori's auto-computed layout = 316 px. Tight
+    // tolerance: ±2 px to absorb any kerning/AA jitter across
+    // satori versions.
+    expect(height).toBeGreaterThanOrEqual(314)
+    expect(height).toBeLessThanOrEqual(318)
+  })
+})
+
 describe('renderMarkdownTableToPng() — overflow-token row (A1.3)', () => {
   // Adversarial fixture used while developing A1.3 (the
   // wordBreak: 'break-word' + simulator break-word-aware fix).
@@ -163,18 +184,21 @@ describe('renderMarkdownTableToPng() — regression on post_a_plus_g_table.md', 
   // 669 × 192, header wrap caught, last-row clip eliminated for the
   // header case. Post-A1.2 (single-word overflow): 669 × 212, bold
   // **post-A+G** in width-8 column now correctly counted as 2 lines.
-  test('full last row is visible (PNG height ≥ 208 px)', async () => {
+  // Post-A1.4 (satori auto-height): 669 × 210 — drops the 2 px of
+  // residual slack the simulator had left, canvas now matches the
+  // actual row-stack layout pixel-for-pixel.
+  test('full last row is visible (PNG height within 208–214 px)', async () => {
     const md = readFileSync(join(FIXTURES_DIR, 'post_a_plus_g_table.md'), 'utf8')
     const png = await renderMarkdownTableToPng(md)
     expect(png).not.toBeNull()
     const { width, height } = pngDims(png as Buffer)
     expect(width).toBe(669)
-    // Need ≥ 208 px to contain header (2 lines) + row 1 (still 1 line
-    // in the simulator — slack absorbs the missed wrap satori does)
-    // + row 2 (1 line) + post-A+G row (now 2 lines via A1.2) + close.
-    // Pre-A1 baseline was 172 (clipped); regression floor of 208
-    // means anything < 208 indicates a regression in either A1 or
-    // A1.2.
+    // Floor 208: anything below indicates a clip regression on either
+    // A1 (markup-aware count → header wraps) or A1.2 (bold
+    // single-word-overflow → post-A+G wraps).
+    // Ceiling 214: anything above indicates the simulator's +24 slack
+    // crept back in (A1.4 regression).
     expect(height).toBeGreaterThanOrEqual(208)
+    expect(height).toBeLessThanOrEqual(214)
   })
 })

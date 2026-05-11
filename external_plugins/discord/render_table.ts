@@ -254,7 +254,7 @@ const LINE_PX = 20
 function buildTree(
   header: Row,
   rows: Row[],
-): { root: VNode; widthPx: number; heightEstPx: number } {
+): { root: VNode; widthPx: number } {
   const colChars = computeColWidths(header, rows)
   const colPx = colChars.map(c => Math.round(c * CHAR_PX) + PAD_X * 2)
   const widthPx = colPx.reduce((a, b) => a + b, 0) + 2
@@ -309,27 +309,7 @@ function buildTree(
     width: widthPx,
   }, [rowNode(header, true), ...rows.map((r, i) => rowNode(r, false, i % 2 === 1))])
 
-  // Height estimate: per row, max wrapped-line count across cells. Uses
-  // word-aware wrap simulation (countWrappedLines) instead of naive
-  // char-density division — the naive version under-counted "Pure JS"
-  // (7 chars in a 7-char column) as 1 line when satori actually wrapped
-  // it to 2 visual lines because real glyph widths exceeded the
-  // CHAR_PX × colChars px budget. Plus vertical padding once per row,
-  // plus row borders. The +24 slack (≈1 line at LINE_PX=20) is the
-  // belt-and-suspenders margin for tight near-overflow cases that the
-  // simulation might still miss (e.g. exact-fit on word boundary that
-  // satori still wraps due to kerning/anti-aliasing).
-  let totalContentPx = 0
-  for (const r of [header, ...rows]) {
-    const lines = r.map((cell, c) =>
-      countWrappedLines(cell, Math.max(colChars[c], 1)),
-    )
-    const maxLines = Math.max(...lines)
-    totalContentPx += maxLines * LINE_PX + PAD_Y * 2 + 1
-  }
-  const heightEstPx = Math.ceil(totalContentPx + 24)
-
-  return { root, widthPx, heightEstPx }
+  return { root, widthPx }
 }
 
 // Pure: parse a markdown pipe-table and render it to a PNG buffer.
@@ -337,18 +317,37 @@ function buildTree(
 // data rows). Throws only on a satori/resvg internal failure — the
 // caller should catch and skip the PNG, leaving the codeblock chunk
 // in place.
+//
+// **Canvas-height strategy** (2026-05-11, A1.4): we pass `height:
+// undefined` to satori so it auto-computes the layout height from the
+// actual rendered row stack. resvg-js then picks the height up from
+// the SVG's `height=` attribute. This replaces a prior approach
+// (A1–A1.3) that ran a `countWrappedLines` simulator + a fixed +24 px
+// slack to predict canvas height — that simulator could only
+// approximate satori's glyph-width budget and ran into systematic
+// under-counts on exact-fit cells (absorbed by the +24 slack) and
+// over-counts on shaved-column tables with long inline-code chips
+// (left ~30 px of blank canvas below the last row). Letting satori
+// measure itself eliminates both error directions: the canvas matches
+// the actual row stack pixel-for-pixel, with no slack and no
+// simulator-vs-render mismatch.
+// `countWrappedLines` is retained, exported, and unit-tested as a
+// **diagnostic / count predictor** (useful for tests + future
+// instrumentation), but it is no longer used to size the SVG canvas.
+// References: vercel/satori Discussion #614 (dynamic-height pattern);
+// `@altano/satori-fit-text` (community library doing the same).
 export async function renderMarkdownTableToPng(md: string): Promise<Buffer | null> {
   const parsed = parseTable(md)
   if (!parsed) return null
   const { header, rows } = parsed
   if (header.length === 0 || rows.length === 0) return null
 
-  const { root, widthPx, heightEstPx } = buildTree(header, rows)
+  const { root, widthPx } = buildTree(header, rows)
   const svg = await satori(root as any, {
     width: widthPx,
-    height: heightEstPx,
+    // height omitted → satori auto-computes from the layout.
     fonts: SATORI_FONTS,
-  })
+  } as any)
   const png = new Resvg(svg, { background: '#181818' }).render().asPng()
   return Buffer.from(png)
 }
