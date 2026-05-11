@@ -95,6 +95,10 @@ Privileged Gateway Intents in use:
 - **Do not** add an Administrator-permission shortcut. The user explicitly rejected this; least-privilege is non-negotiable.
 - **Do not** modify `~/.claude/clive_channels.json` to point at a different path. The plugin path is load-bearing for `--plugin-dir`.
 
+## Known limitations (deferred)
+
+- **Emoji glyphs render as `□` (tofu) in markdown-table PNGs.** Surfaced 2026-05-11 during the A1.2 → A1.4 render-fix arc: `✅` (U+2705 white-heavy-check-mark) in a table cell renders as a placeholder rectangle. Root cause is the `SATORI_FONTS` stack — text fonts only (Inter / DejaVu Sans / similar), no color-emoji font. The cell text itself is rendered correctly; the missing-glyph fallback is what produces the rectangle. **Fix when needed:** add a color-emoji font (Noto Color Emoji TTF, or Twemoji's SVG-in-OT) to the satori font registry. `SATORI_FONTS` lives in `server.ts`'s render-table path. Font file ~10 MB if bundled. Deferred until an actual table relies on emoji glyphs for meaning (status indicators, etc.) — current usage is incidental and `□` is non-confusing in context.
+
 ## Tool reference (mgmt-gated)
 
 `channel/thread/forum CRUD`: `create_channel`, `delete_channel`, `modify_channel`, `create_thread`, `start_forum_post`. **`modify_channel` returns the full updated channel state as JSON** — use this to discover server-assigned IDs after creating new `available_tags`.
