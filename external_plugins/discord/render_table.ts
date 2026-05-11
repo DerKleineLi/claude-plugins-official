@@ -148,6 +148,16 @@ function visibleLen(s: string): number {
 // Without this, header cells like "`vis_a` since `a`" in a 13-char
 // column estimate to 1 line but satori wraps them to 2. Fixture:
 // tests/fixtures/post_a_plus_g_table.md.
+//
+// **Single-word overflow** (2026-05-11, A1.2): the original
+// "single-word = 1 line" floor (a word longer than colWidth still
+// counted as 1 line because we don't break inside a word) under-counted
+// satori's actual wrap behavior. Concrete failure: `**post-A+G**` in a
+// width-8 column. Virtual length after bold scaling is `ceil(8 × 1.10)
+// = 9`, exceeds colWidth=8, satori actually wraps it to 2 lines, but
+// the old code reported 1. Fix: when curLen ends up > colWidth, count
+// `ceil(curLen / colWidth)` lines total (strictly additive — never
+// reports fewer lines than the old formula).
 export function countWrappedLines(cell: string, colWidth: number): number {
   const wordsRaw = cell.split(/\s+/).filter(Boolean)
   if (wordsRaw.length === 0) return 1
@@ -168,6 +178,16 @@ export function countWrappedLines(cell: string, colWidth: number): number {
     } else {
       lines++
       curLen = wordLen
+    }
+    // Single-word overflow: a word (or accumulated line) longer than
+    // colWidth wraps to multiple visual lines in satori. The old code
+    // ignored this; we now charge the additional lines and carry the
+    // remainder as the new curLen so subsequent words land on the
+    // wrapped tail rather than overlapping it.
+    if (curLen > colWidth) {
+      const overflowLines = Math.ceil(curLen / colWidth) - 1
+      lines += overflowLines
+      curLen -= overflowLines * colWidth
     }
   }
   return lines
