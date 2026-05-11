@@ -180,12 +180,21 @@ export function parseElements(text: string): Element[] {
     if (r.kind === 'code') {
       const p = r.payload as { lang: string; source: string }
       const ext = langToExt(p.lang)
+      const langKey = p.lang.trim().toLowerCase()
       if (ext) {
         out.push({ kind: 'code', lang: p.lang, ext, source: p.source })
-      } else {
-        // Unknown / empty lang tag → keep the original fenced block as
-        // prose. The chunker's fence-aware logic will preserve it.
+      } else if (langKey === 'inline') {
+        // Author-opted-in inline rendering via the magic `\`\`\`inline`
+        // tag — keep the original fenced block as prose so Discord
+        // renders it as an inline code block. The chunker's fence-aware
+        // logic will preserve it across chunk boundaries.
         out.push({ kind: 'prose', text: r.rawSlice })
+      } else {
+        // Empty lang OR unknown lang → ship as `code-N.txt`. Discord's
+        // file-preview pane renders .txt inline with monospace, no
+        // syntax highlight, but searchable / scrollable / unbounded by
+        // the 2000-char message limit. Use `\`\`\`inline` to opt out.
+        out.push({ kind: 'code', lang: p.lang, ext: 'txt', source: p.source })
       }
     } else if (r.kind === 'table') {
       const p = r.payload as { mdSource: string }

@@ -534,6 +534,8 @@ const mcp = new Server(
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
+      'Reply text is auto-elementized: markdown pipe-tables ship as PNG + .md, display formulas as PNG + .tex, and fenced code blocks as a single file attachment (recognized lang → code-N.<ext> with syntax highlighting; empty or unknown lang → code-N.txt). To force a fenced code block to stay inline in the message body instead of becoming a file, tag it with ```inline (case-insensitive). Use ```inline for short snippets where the inline render reads better than a separate file preview.',
+      '',
       "fetch_messages pulls real Discord history. Discord's search API isn't available to bots — if the user asks you to find an old message, fetch more history or ask them roughly when it was.",
       '',
       'Server-management tools (create_channel, delete_channel, modify_channel, create_thread, start_forum_post, bulk_delete_messages, pin_message, unpin_message, get_audit_log) are gated on mgmtEnabled in access.json. They operate on the guild — pass guild/channel IDs from the user, not from the inbound chat_id. The user enables these once via /discord:access mgmt on.',

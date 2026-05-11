@@ -555,19 +555,27 @@ describe('buildReplyMessages() — code blocks', () => {
     expect(fileNames(fileMsgs[1])).toEqual(['code-2.ts'])
   })
 
-  test('no-lang code-block stays inline in prose', async () => {
+  test('no-lang code-block becomes code-1.txt file message', async () => {
     const t = '```\nplain\n```'
     const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
     expect(out.length).toBe(1)
-    expect(out[0].content).toBe('```\nplain\n```')
-    expect(out[0].files).toBeUndefined()
+    expect(out[0].content).toBe('')
+    expect(fileNames(out[0])).toEqual(['code-1.txt'])
   })
 
-  test('unknown-lang code-block stays inline in prose', async () => {
+  test('unknown-lang code-block becomes code-1.txt file message', async () => {
     const t = '```madeuplang\nfoo\n```'
     const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
     expect(out.length).toBe(1)
-    expect(out[0].content).toBe('```madeuplang\nfoo\n```')
+    expect(out[0].content).toBe('')
+    expect(fileNames(out[0])).toEqual(['code-1.txt'])
+  })
+
+  test('inline-tagged code-block stays inline in prose', async () => {
+    const t = '```inline\nkeep me inline\n```'
+    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    expect(out.length).toBe(1)
+    expect(out[0].content).toBe('```inline\nkeep me inline\n```')
     expect(out[0].files).toBeUndefined()
   })
 })

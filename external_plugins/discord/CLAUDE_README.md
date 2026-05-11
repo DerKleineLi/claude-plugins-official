@@ -38,19 +38,23 @@ This unification (bare MCP server + `--plugin-dir`, no marketplace) was settled 
   **What ships per element:**
   - **Pipe-tables** → `table-N.png` (satori → SVG → resvg-js, dark theme, adaptive column widths) **+** `table-N.md` (column-normalized via `normalizeTableWidths` so the source is also pretty). PNG is the always-visible artifact; `.md` is searchable/copyable.
   - **Display formulas** (`$$…$$`, `\[…\]`, `\begin{equation|equation*|align|align*|aligned|gather|gather*|multline|multline*}…\end{…}`) → `formula-N.png` (mathjax-full → SVG → resvg-js; `currentColor` rewritten to white; dark `#2c2f33` background) **+** `formula-N.tex` (raw source). Inline `$…$` math stays inside prose by design.
-  - **Fenced code blocks with a known lang tag** → single `code-N.<ext>` file (`lang_extensions.ts` maps highlight.js v10.6.0 lang IDs + common aliases to canonical extensions). Discord shows it with proper syntax highlighting in the preview pane. The fence markers are stripped — the file holds only the inner source. Code blocks with **no** lang tag or an **unrecognized** one stay inline as a fenced code block (the parser re-emits the original fence as prose).
+  - **Fenced code blocks with a known lang tag** → single `code-N.<ext>` file (`lang_extensions.ts` maps highlight.js v10.6.0 lang IDs + common aliases to canonical extensions). Discord shows it with proper syntax highlighting in the preview pane. The fence markers are stripped — the file holds only the inner source.
+  - **Fenced code blocks with empty or unknown lang** → `code-N.txt` (2026-05-11 policy change, replaces the original "stay inline" behavior). Discord renders `.txt` in the file-preview pane with monospace, no syntax highlight, but searchable / scrollable / unbounded by the 2000-char message limit. The right shape for commit lists, log excerpts, untagged code.
+  - **`\`\`\`inline` opt-out**: tag a fence with ` ```inline ` (case-insensitive, whitespace-trimmed) to keep it inline as a regular fenced code block in the message body. Useful for short snippets where the inline render reads better than a separate file preview. The parser re-emits the original fence as prose; the chunker's fence-aware logic preserves it across chunk boundaries.
 
   **Failure modes** (per-element try/catch, never breaks the whole reply):
   - Table PNG render fails → emit `.md` attachment alone (split still happens).
   - Formula PNG render fails → fall back to inline ` ```tex ` code-block of the source. (Bare `.tex` with no visible context would be worse than an inline block.)
-  - Code block — no rendering, only extension lookup; unknown lang already stays inline.
+  - Code block — no rendering, only extension lookup. Empty/unknown lang routes to `.txt`; ` ```inline ` opts back into inline prose.
   - Buffer > `MAX_ATTACHMENT_BYTES` (10 MB) → fall back to inline. Defensive only; chat-reply elements rarely approach this.
 
   **Renderers** are pure modules: `render_table.ts` (satori + resvg-js, vendors DejaVu Sans/Sans-Bold/Sans-Mono under `fonts/`), `render_formula.ts` (mathjax-full + resvg-js, MathJax adapter cached at module scope). Both are imported by `format.ts`; the production `buildReplyMessages` calls them directly. Tests inject stub renderers via `buildReplyMessagesWith` to exercise the pipeline deterministically without spinning up satori/mathjax.
 
   **What was removed:** `wrapPipeTablesAsCodeBlocks`, `splitTableIntoMessages`, `detectOversizedTable`, `TABLE_MULTI_MESSAGE_THRESHOLD` — the multi-message table split, fenced-codeblock wrapping, and oversized-table detection are all subsumed by the file-attach approach (no per-message size limit on the `.md` attachment).
 
-  Tested via `bun test tests/` — `tests/elements.test.ts` covers the parser, `tests/format.test.ts` covers the chunker + buildReplyMessages routing.
+  Tested via `bun test tests/` — `tests/elements.test.ts` covers the parser, `tests/format.test.ts` covers the chunker + buildReplyMessages routing, `tests/render_table.test.ts` (added 2026-05-11) covers `countWrappedLines` and pins a regression test against `tests/fixtures/post_a_plus_g_table.md` (the originally-truncated A+G result table — pre-fix 669 × 172 px with last row clipped, post-fix 669 × 192 px with full last row).
+
+- **2026-05-11** — **Markup-aware `countWrappedLines`** in `render_table.ts`. The wrap simulator now adds the backtick count back into each word's virtual length (each `` ` `` ≈ 4 px of code-span padding via `inlineMd` ≈ 0.5 virtual char at CHAR_PX=7.5) and scales bold runs by 1.10×. Without this, header cells like `` `vis_a` since `a` `` in a 13-char column estimate to 1 line but satori wraps them to 2, and the rendered PNG truncates the last data row. CHAR_PX (7.5) and the bottom `+24 px` slack are unchanged — the simulator-only fix is the strictly-can't-regress shape. CHAR_PX-bump and slack-bump variants were considered and rejected (would widen every table 7% and add 16 px of bottom padding; the simulator-only fix lands the same wins without those side-effects).
 
 ## Architecture rationale
 

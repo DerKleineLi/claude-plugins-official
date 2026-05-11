@@ -75,16 +75,33 @@ describe('parseElements() — basics', () => {
     ])
   })
 
-  test('code-block with no lang stays inline as prose (original fence)', () => {
+  test('no-lang code-block ships as code-N.txt', () => {
     const t = '```\nplain\n```'
     const out = parseElements(t)
-    expect(out).toEqual([{ kind: 'prose', text: '```\nplain\n```' }])
+    expect(out).toEqual([{ kind: 'code', lang: '', ext: 'txt', source: 'plain' }])
   })
 
-  test('code-block with unknown lang stays inline as prose (original fence)', () => {
+  test('unknown-lang code-block ships as code-N.txt', () => {
     const t = '```madeuplang\nfoo\n```'
     const out = parseElements(t)
-    expect(out).toEqual([{ kind: 'prose', text: '```madeuplang\nfoo\n```' }])
+    expect(out).toEqual([
+      { kind: 'code', lang: 'madeuplang', ext: 'txt', source: 'foo' },
+    ])
+  })
+
+  test('inline-tagged fence (```inline) stays inline as prose', () => {
+    const t = '```inline\nkeep me inline\n```'
+    const out = parseElements(t)
+    expect(out).toEqual([{ kind: 'prose', text: '```inline\nkeep me inline\n```' }])
+  })
+
+  test('inline-tag is case-insensitive and whitespace-trimmed', () => {
+    expect(parseElements('```Inline\nfoo\n```')).toEqual([
+      { kind: 'prose', text: '```Inline\nfoo\n```' },
+    ])
+    expect(parseElements('```  INLINE  \nfoo\n```')).toEqual([
+      { kind: 'prose', text: '```  INLINE  \nfoo\n```' },
+    ])
   })
 
   test('code-block with known lang becomes a code element', () => {
@@ -103,13 +120,20 @@ describe('parseElements() — basics', () => {
     expect(out[1]).toMatchObject({ kind: 'code', lang: 'ts', ext: 'ts', source: 'let x = 1' })
   })
 
-  test('unknown-lang fence between two prose pieces coalesces', () => {
+  test('unknown-lang fence between two prose pieces ships as code-N.txt', () => {
     const t = 'A.\n```madeup\nfoo\n```\nB.'
+    const out = parseElements(t)
+    expect(out.map(e => e.kind)).toEqual(['prose', 'code', 'prose'])
+    expect(out[1]).toEqual({ kind: 'code', lang: 'madeup', ext: 'txt', source: 'foo' })
+  })
+
+  test('inline-tagged fence between two prose pieces coalesces', () => {
+    const t = 'A.\n```inline\nfoo\n```\nB.'
     const out = parseElements(t)
     expect(out.length).toBe(1)
     expect(out[0]).toEqual({
       kind: 'prose',
-      text: 'A.\n```madeup\nfoo\n```\nB.',
+      text: 'A.\n```inline\nfoo\n```\nB.',
     })
   })
 })
