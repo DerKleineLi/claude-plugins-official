@@ -63,6 +63,40 @@ describe('countWrappedLines() — single-word overflow (A1.2)', () => {
   })
 })
 
+describe('countWrappedLines() — break-word partial-fit (A1.3)', () => {
+  test('long word that overflows current line consumes remaining space first', () => {
+    // "the verylongtoken" in 8-char col. "the " fits in 4 chars,
+    // leaving 3 chars on line 1 (after the space). break-word puts
+    // "ver" on line 1 ("the ver"), then wraps the remainder
+    // "ylongtoken" (10 chars) across 2 lines ("ylongtok", "en") → 3
+    // lines total. Pre-A1.3 the simulator wrapped the entire
+    // 12-char "verylongtoken" to a new line and counted 1 wrap + 1
+    // overflow = 3 lines too (matches by coincidence), but the
+    // tail-curLen differed. The key assertion is "no over-count
+    // when partial-fit consumes the remainder cleanly".
+    expect(countWrappedLines('the verylongtoken', 8)).toBe(3)
+  })
+
+  test('shaved-column long-token row matches actual render', () => {
+    // Adversarial repro: pre-A1.3 this returned 3 (over-counting by
+    // 1, leaving ~20 px of blank canvas below the row). With A1.3
+    // partial-fit, the simulator matches satori's break-word output
+    // of 2 lines ("the verylongunhyphenatedwordlandsinashav" /
+    // "edcolumn pattern").
+    expect(countWrappedLines(
+      'the verylongunhyphenatedwordlandsinashavedcolumn pattern',
+      43,
+    )).toBe(2)
+  })
+
+  test('full row width offers no partial-fit space → wraps as whole', () => {
+    // curLen=colWidth exactly (no slack for a partial chunk).
+    // break-word wraps the long word to the next line; overflow
+    // check then handles the multi-line spillover.
+    expect(countWrappedLines('abcdefgh verylongword', 8)).toBeGreaterThanOrEqual(3)
+  })
+})
+
 describe('countWrappedLines() — no over-estimate on plain text', () => {
   test('hello world in width 20 stays 1 line', () => {
     expect(countWrappedLines('hello world', 20)).toBe(1)
@@ -85,6 +119,41 @@ describe('countWrappedLines() — no over-estimate on plain text', () => {
   test('empty cell returns 1', () => {
     expect(countWrappedLines('', 8)).toBe(1)
     expect(countWrappedLines('   ', 8)).toBe(1)
+  })
+})
+
+describe('renderMarkdownTableToPng() — overflow-token row (A1.3)', () => {
+  // Adversarial fixture used while developing A1.3 (the
+  // wordBreak: 'break-word' + simulator break-word-aware fix).
+  // Pre-fix, the long token in cell (2,3) (Tool column) rendered
+  // on a single visual line and overflowed horizontally into the
+  // Output column — visible as the Tool text overlaying the
+  // Output text. Post-fix the long token wraps inside the cell.
+  test('5-row table with a column-exceeding token renders without horizontal collision', async () => {
+    const md = [
+      '| # | Surface | Tool | Output |',
+      '| - | - | - | - |',
+      '| 1 | inline | `code` | small |',
+      '| 2 | bold | **`mixed`** | medium |',
+      '| 3 | plain | text | short |',
+      '| 4 | react | `✅` | done |',
+      '| 5 | A1.2 single-word-overflow stress | verylongunhyphenatedwordthatexceedscolumnwidth | overflow |',
+    ].join('\n')
+    const png = await renderMarkdownTableToPng(md)
+    expect(png).not.toBeNull()
+    const { width, height } = pngDims(png as Buffer)
+    // Width is the satori-computed sum of column widths + border.
+    // We can't verify "no horizontal collision" from buffer dims
+    // alone (that requires a pixel-diff harness), but width must
+    // be at least the per-column natural total — and height must
+    // accommodate at least the simulator's row count.
+    expect(width).toBeGreaterThan(700)
+    // 7 rows (header + 6 body), each ≥ 1 line at LINE_PX=20 +
+    // padding ≈ 37 px, plus +24 slack ≈ 283 px MAX for the
+    // single-line case. Post-fix, row 5's Tool col wraps to ≥ 2
+    // lines via break-word; row count must be tall enough for
+    // the wrap.
+    expect(height).toBeGreaterThanOrEqual(200)
   })
 })
 

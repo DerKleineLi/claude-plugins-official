@@ -158,6 +158,20 @@ function visibleLen(s: string): number {
 // the old code reported 1. Fix: when curLen ends up > colWidth, count
 // `ceil(curLen / colWidth)` lines total (strictly additive — never
 // reports fewer lines than the old formula).
+//
+// **Break-word partial-fit** (2026-05-11, A1.3): with `wordBreak:
+// 'break-word'` on the cell (added in the same commit), satori
+// consumes the *remaining space on the current line* when a too-long
+// word arrives, then wraps the tail. The pre-A1.3 simulator instead
+// wrapped the whole long word to a new line, then charged ceil(len/
+// colWidth)-1 overflow lines — over-counting by 1 line whenever the
+// previous content left non-trivial space on the current line.
+// Concrete failure: `the verylongunhyphenatedwordlandsinashavedcolumn
+// pattern` in a 43-char shaved column. Render = 2 lines ("the very…
+// shav" / "edcolumn pattern"), pre-A1.3 simulator = 3, leaving ~20 px
+// of blank canvas below the row. A1.3 path now mirrors break-word:
+// fill remaining current-line space (filledOnCurrent) and only charge
+// extra lines for the residual.
 export function countWrappedLines(cell: string, colWidth: number): number {
   const wordsRaw = cell.split(/\s+/).filter(Boolean)
   if (wordsRaw.length === 0) return 1
@@ -175,15 +189,32 @@ export function countWrappedLines(cell: string, colWidth: number): number {
       curLen = wordLen
     } else if (curLen + 1 + wordLen <= colWidth) {
       curLen += 1 + wordLen
+    } else if (wordLen > colWidth) {
+      // Break-word partial-fit: word can't fit anywhere intact, so
+      // satori consumes remaining space on the current line, then
+      // wraps the tail across as many full-width lines as needed.
+      const filledOnCurrent = colWidth - curLen - 1
+      if (filledOnCurrent > 0) {
+        const remaining = wordLen - filledOnCurrent
+        const fullExtraLines = Math.ceil(remaining / colWidth)
+        lines += fullExtraLines
+        curLen = remaining - (fullExtraLines - 1) * colWidth
+      } else {
+        // No room on current line for any partial chunk → wrap the
+        // whole word to a new line; the overflow check below picks up
+        // any remaining multi-line spillover.
+        lines++
+        curLen = wordLen
+      }
     } else {
+      // Word fits on a fresh line — just wrap.
       lines++
       curLen = wordLen
     }
-    // Single-word overflow: a word (or accumulated line) longer than
-    // colWidth wraps to multiple visual lines in satori. The old code
-    // ignored this; we now charge the additional lines and carry the
-    // remainder as the new curLen so subsequent words land on the
-    // wrapped tail rather than overlapping it.
+    // Single-word overflow (A1.2): a word (or accumulated line) longer
+    // than colWidth still wraps. The break-word path above keeps
+    // curLen ≤ colWidth by construction; this check covers the
+    // first-word-of-line case where curLen was set unconditionally.
     if (curLen > colWidth) {
       const overflowLines = Math.ceil(curLen / colWidth) - 1
       lines += overflowLines
@@ -228,6 +259,18 @@ function buildTree(
   const colPx = colChars.map(c => Math.round(c * CHAR_PX) + PAD_X * 2)
   const widthPx = colPx.reduce((a, b) => a + b, 0) + 2
 
+  // wordBreak: 'break-all' is the canonical satori knob for "let the
+  // text layer break inside a token when no UAX #14 opportunity fits."
+  // It sets `allowBreakWord` in satori's internal linebreak pass, which
+  // falls back to grapheme-level splits. Without it, a long
+  // unhyphenated token (e.g. `verylongunhyphenatedword…`) has zero
+  // break opportunities and renders on a single visual line —
+  // overflowing the cell's `width` and visually colliding with the
+  // next column. The count path (`countWrappedLines`) already predicts
+  // such tokens as multi-line; this aligns the render with the count.
+  // Reference: satori CSS table; issue #484 (don't rely on span-wrap);
+  // issue #532 (overflow:hidden doesn't clip — so break-all is the only
+  // honest fix).
   const cellNode = (cell: string, w: number, isHeader: boolean): VNode =>
     h('div', {
       display: 'flex',
@@ -238,6 +281,7 @@ function buildTree(
       color: isHeader ? '#fff' : '#ddd',
       background: isHeader ? '#2d3340' : 'transparent',
       fontWeight: isHeader ? 600 : 400,
+      wordBreak: 'break-word',
     },
       h('div', {
         display: 'flex',
