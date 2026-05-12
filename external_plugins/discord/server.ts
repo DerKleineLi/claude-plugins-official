@@ -29,6 +29,7 @@ import {
   ActionRowBuilder,
   AttachmentBuilder,
   type Message,
+  type PartialMessage,
   type Attachment,
   type Interaction,
   type MessageReaction,
@@ -529,6 +530,8 @@ const mcp = new Server(
       'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
       "If the tag has a reply_to_message_id attribute, the sender used Discord's reply gesture on a prior message — use reply_to_message_id (and the optional reply_to_text snippet) to know which thread they're responding to.",
+      '',
+      "If the tag has an edit_of_message_id attribute, the sender edited a previously-sent message — message_id and edit_of_message_id both identify the same Discord message; the body is the new full content (not a diff). Use original_ts for the original send time and ts for the edit time. Small typo fixes usually don't need acknowledgement, but a substantive change may shift the request — re-evaluate before continuing.",
       '',
       "If the tag has a reaction attribute, the sender added or changed an emoji reaction on the message identified by message_id; typically just acknowledge it silently and don't auto-reply unless context warrants a response. A reaction_removed attribute means a previously-set emoji was cleared.",
       '',
@@ -1320,6 +1323,18 @@ client.on('messageCreate', msg => {
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
 })
 
+// Edit events — emitted when a user edits a previously-sent message. Forward
+// the new full content with edit_of_message_id set so the agent can
+// re-evaluate intent without us shipping a diff. Bot's own edits (the
+// edit_message progress-update path) and auto-embed events (link unfurls,
+// which fire MESSAGE_UPDATE without setting edited_timestamp) are filtered
+// inside handleUpdate.
+client.on('messageUpdate', (_oldMsg, newMsg) => {
+  handleUpdate(newMsg).catch(e =>
+    process.stderr.write(`discord: handleUpdate failed: ${e}\n`),
+  )
+})
+
 // Reaction events — emitted when a user adds or removes an emoji on a
 // message in an allowlisted DM/channel. Mirrors the telegram parity patch.
 // The system-prompt instructions tell the agent to typically acknowledge
@@ -1488,6 +1503,78 @@ async function handleInbound(msg: Message): Promise<void> {
     },
   }).catch(err => {
     process.stderr.write(`discord channel: failed to deliver inbound to Claude: ${err}\n`)
+  })
+}
+
+async function handleUpdate(msg: Message | PartialMessage): Promise<void> {
+  // Resolve partial — messageUpdate fires for messages the bot didn't cache
+  // (older history a user goes back and edits). If fetching fails (deleted
+  // mid-flight, missing perms), bail.
+  if (msg.partial) {
+    try { await msg.fetch() } catch { return }
+  }
+  const full = msg as Message
+
+  // Skip the bot's own edits (the edit_message progress-update path) and
+  // edits by other bots. Mirrors the messageCreate filter + the reaction
+  // handler's own-id skip.
+  if (full.author?.id === client.user?.id) return
+  if (full.author?.bot) return
+
+  // Filter auto-embed / link-unfurl MESSAGE_UPDATE events. Discord fires
+  // these when an embed gets generated on a posted link; edited_timestamp
+  // is null in that case and an ISO timestamp on real user edits.
+  if (!full.editedTimestamp) return
+
+  // Gate the edit the same way we gate a fresh message. Pair mode is
+  // dropped here — re-issuing a pairing code on an edit would be
+  // incoherent (the original message already had its gate decision).
+  const result = await gate(full)
+  if (result.action !== 'deliver') return
+
+  const chat_id = full.channelId
+
+  // Attachments listing — same shape as handleInbound. Edits can change
+  // the attachments array.
+  const atts: string[] = []
+  for (const att of full.attachments.values()) {
+    const kb = (att.size / 1024).toFixed(0)
+    atts.push(`${safeAttName(att)} (${att.contentType ?? 'unknown'}, ${kb}KB)`)
+  }
+
+  const content = full.content || (atts.length > 0 ? '(attachment)' : '')
+
+  // Reply-to fields — the reply reference doesn't change on edit, but
+  // it's still part of the message envelope; carry it through.
+  const replyToFields: Record<string, string> = {}
+  if (full.reference?.messageId) {
+    replyToFields.reply_to_message_id = full.reference.messageId
+    try {
+      const ref = await full.fetchReference()
+      if (ref.author?.username) replyToFields.reply_to_user = ref.author.username
+      if (ref.author?.id) replyToFields.reply_to_user_id = ref.author.id
+      if (ref.content) replyToFields.reply_to_text = ref.content.slice(0, 200)
+    } catch {}
+  }
+
+  void mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content,
+      meta: {
+        chat_id,
+        message_id: full.id,
+        edit_of_message_id: full.id,
+        user: full.author.username,
+        user_id: full.author.id,
+        ts: new Date(full.editedTimestamp).toISOString(),
+        original_ts: full.createdAt.toISOString(),
+        ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
+        ...replyToFields,
+      },
+    },
+  }).catch(err => {
+    process.stderr.write(`discord channel: failed to deliver edit to Claude: ${err}\n`)
   })
 }
 

@@ -64,6 +64,23 @@ This unification (bare MCP server + `--plugin-dir`, no marketplace) was settled 
 
 - **2026-05-11** — `list_threads` read-only forum-post enumeration tool. Wraps discord.js `ForumChannel.threads.fetchActive()` (guild-wide endpoint, filtered to the forum by parent_id in `_mapThreads`) and `fetchArchived({type:'public', before})` (paginated, 100/page, 50-page cap). Server-side `applied_tag_filter` and `include_archived` flags. Not gated on `mgmtEnabled` — pure read, composes with the always-on `get_channel`. Returns a `ThreadSummary[]` shape that's a strict subset of `channelStateJson`. See `Tool reference (read-only, no gate)` below.
 
+- **2026-05-12** — **MessageUpdate capture.** New `client.on('messageUpdate', …)` listener + `handleUpdate(msg)` function. When a user edits a previously-sent message, the plugin emits a fresh `notifications/claude/channel` with the new full content (not a diff) and an `edit_of_message_id` attribute on the `<channel>` tag (equal to `message_id` — Discord doesn't renumber on edit, but the attribute's *presence* is the signal that this is an edit-event vs a create-event). `ts` carries the edit time, `original_ts` carries the original send time.
+
+  **Three filters in `handleUpdate`, all needed:**
+  1. **Partial resolution** — `if (msg.partial) await msg.fetch()`. Edits on older uncached messages arrive partial (`Partials.Message` was already in the constructor for reactions; reused here). Bail on fetch failure.
+  2. **Bot-own + bot-other** — `if (full.author?.id === client.user?.id) return; if (full.author?.bot) return`. Critical: the plugin's own `edit_message` tool path (used for progress updates) fires `messageUpdate` on the gateway with `author.id === client.user.id`. Without this filter every progress edit loops back as a fake user-edit notification.
+  3. **Auto-embed / link-unfurl skip** — `if (!full.editedTimestamp) return`. Discord fires `MESSAGE_UPDATE` when it auto-generates an embed for a posted link (image preview, OG card). `edited_timestamp` is **null** in that case and an ISO timestamp on real user edits. This is the cleanest signal — Discord's docs list the field as part of every MESSAGE_UPDATE payload, and discord.js exposes it as `msg.editedTimestamp` (epoch ms) / `msg.editedAt` (Date).
+
+  **Drop-on-`pair`** decision: `gate()` returns `'pair'` for non-allowlisted DM senders, allocating a pairing code. On *edit* this would be incoherent — the original message already had its gate decision, and re-issuing a code on edit would spam the sender. `handleUpdate` treats any non-`'deliver'` gate result as a drop.
+
+  **Re-evaluated gate on edit:** if the user edits a message to *add* `@mention` (or removes one in a `requireMention` channel), gate() naturally reflects the new state. This is intentional — matches what would happen if they'd posted the new content as a fresh message.
+
+  **No content-actually-changed dedupe.** `oldMessage.content` is unreliable in discord.js (often null unless previously cached — long-standing upstream issue), so we forward every edit that passes the bot/auto-embed filters even when content is bit-identical. Genuine edits are infrequent; not worth a fingerprint cache.
+
+  **No new intents / no new bot permissions.** Existing `GuildMessages` + `MessageContent` + `DirectMessages` intents already cover MESSAGE_UPDATE. `Partials.Message` was already there.
+
+  System-prompt instructions block (`server.ts` ~line 532) carries a new paragraph telling the agent that `edit_of_message_id` presence means "this is an edit; body is new full content, not a diff; `original_ts` is original send time, `ts` is edit time; small typo fixes don't need acknowledgement, substantive changes may shift intent."
+
 ## Architecture rationale
 
 Single-user, single-server, private bot. Trust model:
