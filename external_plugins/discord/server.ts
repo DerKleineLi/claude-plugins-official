@@ -251,6 +251,20 @@ function noteSent(id: string): void {
   }
 }
 
+// Track message IDs the bot deleted via bulk_delete_messages, so the
+// resulting MESSAGE_DELETE gateway events don't loop back to the agent as
+// fake user-deletion notifications. Same eviction shape as recentSentIds.
+const botInitiatedDeletions = new Set<string>()
+const BOT_DELETIONS_CAP = 200
+
+function noteBotDeleted(id: string): void {
+  botInitiatedDeletions.add(id)
+  if (botInitiatedDeletions.size > BOT_DELETIONS_CAP) {
+    const first = botInitiatedDeletions.values().next().value
+    if (first) botInitiatedDeletions.delete(first)
+  }
+}
+
 async function gate(msg: Message): Promise<GateResult> {
   const access = loadAccess()
   const pruned = pruneExpired(access)
@@ -532,6 +546,8 @@ const mcp = new Server(
       "If the tag has a reply_to_message_id attribute, the sender used Discord's reply gesture on a prior message — use reply_to_message_id (and the optional reply_to_text snippet) to know which thread they're responding to.",
       '',
       "If the tag has an edit_of_message_id attribute, the sender edited a previously-sent message — message_id and edit_of_message_id both identify the same Discord message; the body is the new full content (not a diff). Use original_ts for the original send time and ts for the edit time. Small typo fixes usually don't need acknowledgement, but a substantive change may shift the request — re-evaluate before continuing.",
+      '',
+      "If the tag has a deleted='true' attribute, the sender (or an admin) deleted the message identified by message_id. The body is the last-known content if the bot still had it cached, or empty when uncached. user/original_ts are present only when cached. Treat this as a meta-event — usually don't reply unless the deleted message was load-bearing for an ongoing task (e.g. it contained the request you're acting on). A bulk_delete='true' attribute marks deletes that arrived as part of a batch (often a channel cleanup).",
       '',
       "If the tag has a reaction attribute, the sender added or changed an emoji reaction on the message identified by message_id; typically just acknowledge it silently and don't auto-reply unless context warrants a response. A reaction_removed attribute means a previously-set emoji was cleared.",
       '',
@@ -1109,6 +1125,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // filterOld=true → discord.js strips messages >14 days client-side so
         // the batch isn't rejected wholesale. Returns Collection of deleted.
         const deleted = await (ch as any).bulkDelete(unique, true)
+        // Suppress the resulting MESSAGE_DELETE gateway events — they're
+        // bot-initiated, not user-initiated, and shouldn't surface to the
+        // agent as fake delete notifications.
+        for (const id of deleted.keys()) noteBotDeleted(id as string)
         return {
           content: [{ type: 'text', text: `deleted ${deleted.size}/${unique.length} messages (older than 14 days are skipped)` }],
         }
@@ -1333,6 +1353,26 @@ client.on('messageUpdate', (_oldMsg, newMsg) => {
   handleUpdate(newMsg).catch(e =>
     process.stderr.write(`discord: handleUpdate failed: ${e}\n`),
   )
+})
+
+// Delete events — emitted when a user (or admin) deletes a message in an
+// allowlisted channel/DM. Discord's MESSAGE_DELETE payload is tiny (id +
+// channel_id only); the rest comes from discord.js's cache if the message
+// was previously seen. msg.fetch() can't recover anything — the resource
+// is already gone server-side. Bot-initiated deletes (the bulk_delete_messages
+// tool path) are filtered via botInitiatedDeletions inside handleDelete.
+client.on('messageDelete', msg => {
+  handleDelete(msg).catch(e =>
+    process.stderr.write(`discord: handleDelete failed: ${e}\n`),
+  )
+})
+
+client.on('messageDeleteBulk', messages => {
+  for (const msg of messages.values()) {
+    handleDelete(msg, { bulk: true }).catch(e =>
+      process.stderr.write(`discord: handleDelete (bulk) failed: ${e}\n`),
+    )
+  }
 })
 
 // Reaction events — emitted when a user adds or removes an emoji on a
@@ -1575,6 +1615,89 @@ async function handleUpdate(msg: Message | PartialMessage): Promise<void> {
     },
   }).catch(err => {
     process.stderr.write(`discord channel: failed to deliver edit to Claude: ${err}\n`)
+  })
+}
+
+async function handleDelete(
+  msg: Message | PartialMessage,
+  opts?: { bulk?: boolean },
+): Promise<void> {
+  // Filter bot-initiated deletes (the bulk_delete_messages mgmt tool path)
+  // first — these are user-authored messages but the bot caused the delete,
+  // so the standard author.id === client.user.id check below would miss them.
+  if (botInitiatedDeletions.has(msg.id)) return
+
+  // Filter the bot's own messages getting deleted (catches a future
+  // delete_message tool if added) and other bots.
+  if (msg.author?.id === client.user?.id) return
+  if (msg.author?.bot) return
+
+  // Do NOT attempt msg.fetch() — the message is already gone server-side
+  // and the fetch would just throw. Work with whatever discord.js cached.
+
+  const chat_id = msg.channelId
+  if (!chat_id) return
+
+  // Lightweight channel-only gate. We can't reuse gate() because it needs
+  // msg.author for the mention check, and partials usually lack it. A delete
+  // is a meta-event about channel state, so the channel-allowlist check is
+  // the load-bearing one; requireMention is intentionally skipped.
+  const access = loadAccess()
+  if (access.dmPolicy === 'disabled') return
+
+  const channel = msg.channel
+  if (channel?.type === ChannelType.DM) {
+    // DMs: per-user allowlist. If we don't know the author (uncached partial),
+    // we can't allowlist-check — drop silently to preserve the access model.
+    if (!msg.author?.id || !access.allowFrom.includes(msg.author.id)) return
+  } else {
+    const channelKey = channel?.isThread?.() ? channel.parentId ?? chat_id : chat_id
+    if (!access.groups[channelKey]) return
+  }
+
+  // Optional cached fields — present only if discord.js had the message.
+  const atts: string[] = []
+  if (!msg.partial) {
+    for (const att of (msg as Message).attachments.values()) {
+      const kb = (att.size / 1024).toFixed(0)
+      atts.push(`${safeAttName(att)} (${att.contentType ?? 'unknown'}, ${kb}KB)`)
+    }
+  }
+
+  const replyToFields: Record<string, string> = {}
+  if (msg.reference?.messageId) {
+    replyToFields.reply_to_message_id = msg.reference.messageId
+    // The referenced message may still exist independently of the deleted one.
+    try {
+      const ref = await (msg as Message).fetchReference()
+      if (ref.author?.username) replyToFields.reply_to_user = ref.author.username
+      if (ref.author?.id) replyToFields.reply_to_user_id = ref.author.id
+      if (ref.content) replyToFields.reply_to_text = ref.content.slice(0, 200)
+    } catch {}
+  }
+
+  void mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: msg.content ?? '',
+      meta: {
+        chat_id,
+        message_id: msg.id,
+        deleted: 'true',
+        ...(msg.author?.username
+          ? { user: msg.author.username, user_id: msg.author.id }
+          : {}),
+        ts: new Date().toISOString(),
+        ...(msg.createdAt ? { original_ts: msg.createdAt.toISOString() } : {}),
+        ...(opts?.bulk ? { bulk_delete: 'true' } : {}),
+        ...(atts.length > 0
+          ? { attachment_count: String(atts.length), attachments: atts.join('; ') }
+          : {}),
+        ...replyToFields,
+      },
+    },
+  }).catch(err => {
+    process.stderr.write(`discord channel: failed to deliver delete to Claude: ${err}\n`)
   })
 }
 

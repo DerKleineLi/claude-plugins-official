@@ -83,6 +83,29 @@ This unification (bare MCP server + `--plugin-dir`, no marketplace) was settled 
 
   System-prompt instructions block (`server.ts` ~line 532) carries a new paragraph telling the agent that `edit_of_message_id` presence means "this is an edit; body is new full content, not a diff; `original_ts` is original send time, `ts` is edit time; small typo fixes don't need acknowledgement, substantive changes may shift intent."
 
+- **2026-05-12** — **MessageDelete capture.** New `client.on('messageDelete', …)` and `client.on('messageDeleteBulk', …)` listeners (the bulk listener fans out per-message into the same `handleDelete`) + `handleDelete(msg, opts?)` function. When a user (or admin) deletes a message in an allowlisted channel, the plugin emits a `notifications/claude/channel` with `deleted='true'` (marker attribute), `ts=<delete-detect time>`, and — when discord.js had the message cached — `user`, `user_id`, `original_ts`, plus the last-known body and any cached `attachment_count` / `reply_to_message_id`. Bulk-arrival deletes carry an extra `bulk_delete='true'` attribute.
+
+  **Why we do not `msg.fetch()` on partials.** Per Discord docs and discord.js's own partials guide, `MESSAGE_DELETE` carries only `{id, channel_id, optional guild_id}` and the message resource is already gone server-side — `fetch()` will throw. Work with whatever discord.js cached (a fresh delete usually has full data because the bot saw the `messageCreate` seconds earlier); on uncached partials, emit with an empty body and omit `user` / `original_ts`.
+
+  **Three filters in `handleDelete`, all needed:**
+  1. **`botInitiatedDeletions.has(msg.id)`** — checked FIRST, before any author check. The `bulk_delete_messages` mgmt tool deletes user-authored messages (so `msg.author.id !== client.user.id`), but the bot caused the delete; without this filter every `bulk_delete_messages` call would loop the cleared IDs back as fake user-delete notifications. The set is a small in-memory ring buffer (~200 entries, eviction mirrors `recentSentIds`) populated in `bulk_delete_messages`'s case branch.
+  2. **`msg.author?.id === client.user?.id`** — catches a future single-message `delete_message` tool path if/when added.
+  3. **`msg.author?.bot`** — skips other bots.
+
+  **Lightweight channel-only gate (does NOT reuse `gate()`).** `gate()` requires `msg.author` for the `requireMention` re-check, and partials usually lack it. A delete is a meta-event about channel state, so the channel-allowlist check is the load-bearing one. Concretely:
+  - **DM:** require `msg.author?.id` to be known AND in `access.allowFrom`. Partial DM deletes without author drop silently — we have no allowlist key to check against.
+  - **Guild:** look up `chat_id` (resolving thread → parent) in `access.groups`; drop if absent. **`requireMention` is intentionally not checked** — partials usually lack mention data, and a delete of a non-mention message in a `requireMention` channel still surfaces.
+
+  **No audit-log enrichment (deferred).** Discord only writes an audit-log entry when *someone other than the author* deletes a message AND the deleter is not a bot — so self-deletes (the common case) generate no entry. There is also no event-to-log correlation field; matching would require timing heuristics with rate-limit cost on every delete. Easy to add as a Phase 3.5 patch if a moderation use-case ever surfaces.
+
+  **No content-recovery cache.** discord.js's own internal cache populates `msg.content` on fresh-deletes (the bot saw the create event seconds earlier), so a separate ring buffer would mostly duplicate it. Privacy: keeping deleted content past discord.js's natural lifetime extends retention scope beyond "current session memory." If the natural cache hit rate proves too low in practice, revisit in Phase 3.5 with a ~30-LOC ring buffer (200 entries, populated on `messageCreate`, read on `messageDelete`).
+
+  **Bulk handling is fan-out, not aggregate.** `messageDeleteBulk` iterates and calls `handleDelete(msg, { bulk: true })` per message. Reuses the gate + filter logic cleanly; the agent gets per-message context. The `bulk_delete='true'` meta-attribute marks each as part of a batch (often a channel cleanup).
+
+  **No new intents / no new bot permissions.** Same `GuildMessages` + `MessageContent` + `DirectMessages` cover MESSAGE_DELETE / MESSAGE_DELETE_BULK. `Partials.Message` was already there.
+
+  System-prompt instructions block (`server.ts` ~line 536) carries a new paragraph documenting the `deleted='true'` attribute, the cached-vs-empty body, and the `bulk_delete='true'` flag.
+
 ## Architecture rationale
 
 Single-user, single-server, private bot. Trust model:
