@@ -17,13 +17,59 @@
 //   - resvg-js renders SVG → PNG via napi-prebuilds (no Chromium, no
 //     subprocess), giving a ~50 ms warm render in-process.
 
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import satori from 'satori'
 import { Resvg } from '@resvg/resvg-js'
 
 const FONTS_DIR = join(dirname(fileURLToPath(import.meta.url)), 'fonts')
+
+// Color-emoji rendering: satori's text path uses the DejaVu fonts above
+// (no color-emoji glyphs), so emoji codepoints would render as tofu (□).
+// satori exposes `loadAdditionalAsset(code='emoji', segment)` for this:
+// the hook supplies a per-emoji SVG data URI that satori inlines into
+// the rendered glyph slot. We pull from jsDelivr's Twemoji mirror
+// (pinned to @15.1.0 for reproducible asset bytes) and cache each
+// fetched SVG under `os.tmpdir()/twemoji_cache/<cp>.svg`. First render
+// of a given emoji does a single network hit; every subsequent render
+// (same process or fresh) is a local disk read.
+// Reference: vercel/satori README "Emojis" section; jdecked/twemoji asset layout.
+const TWEMOJI_VERSION = '15.1.0'
+const TW_CACHE = join(tmpdir(), 'twemoji_cache')
+if (!existsSync(TW_CACHE)) mkdirSync(TW_CACHE, { recursive: true })
+
+// Twemoji filename codepoint slug. Variation selector U+FE0F is stripped
+// unless it's the only codepoint (e.g. keycap `1️⃣` → `0031-fe0f-20e3`,
+// but `❤️` → `2764`, not `2764-fe0f`).
+function toCodePoint(emoji: string): string {
+  const cps: number[] = []
+  for (const ch of emoji) cps.push(ch.codePointAt(0)!)
+  const hasNonVS = cps.some(c => c !== 0xfe0f)
+  const filtered = cps.length > 1 && hasNonVS ? cps.filter(c => c !== 0xfe0f) : cps
+  return filtered.map(c => c.toString(16)).join('-')
+}
+
+async function loadEmoji(segment: string): Promise<string> {
+  const cp = toCodePoint(segment)
+  const cacheFile = join(TW_CACHE, `${cp}.svg`)
+  let svgText: string
+  if (existsSync(cacheFile)) {
+    svgText = readFileSync(cacheFile, 'utf8')
+  } else {
+    const url = `https://cdn.jsdelivr.net/gh/jdecked/twemoji@${TWEMOJI_VERSION}/assets/svg/${cp}.svg`
+    const res = await fetch(url)
+    if (!res.ok) {
+      console.error(`[render_table] twemoji miss for ${cp} (HTTP ${res.status})`)
+      return ''
+    }
+    svgText = await res.text()
+    writeFileSync(cacheFile, svgText)
+    console.error(`[render_table] twemoji cached ${cp}.svg`)
+  }
+  return `data:image/svg+xml;base64,${Buffer.from(svgText).toString('base64')}`
+}
 
 // Load once at module scope. If a font file is missing, throw at import
 // time rather than at render time — the missing-fonts state is a build/
@@ -347,6 +393,10 @@ export async function renderMarkdownTableToPng(md: string): Promise<Buffer | nul
     width: widthPx,
     // height omitted → satori auto-computes from the layout.
     fonts: SATORI_FONTS,
+    loadAdditionalAsset: async (code: string, segment: string) => {
+      if (code === 'emoji') return await loadEmoji(segment)
+      return ''
+    },
   } as any)
   const png = new Resvg(svg, { background: '#181818' }).render().asPng()
   return Buffer.from(png)
