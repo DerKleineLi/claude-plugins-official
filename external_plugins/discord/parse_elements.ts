@@ -36,6 +36,11 @@ export type Element =
   | { kind: 'code'; lang: string; ext: string; source: string }
 
 const TABLE_SEP_RE = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$/
+// Strip a single leading blockquote marker so tables inside `>` quotes
+// are still detected. We only normalize for detection — `mdSource` is
+// rebuilt from stripped lines so `render_table.ts:parseTable` sees clean
+// pipes (it tolerates either form anyway).
+const BLOCKQUOTE_PREFIX_RE = /^\s*>\s?/
 const FENCE_OPEN_RE = /^\s*(`{3,})\s*(\S.*)?$/
 const FENCE_CLOSE_RE = /^\s*(`{3,})\s*$/
 
@@ -124,22 +129,34 @@ export function parseElements(text: string): Element[] {
       }
     }
   }
+  // Pre-strip a single blockquote prefix per line for detection. The
+  // unstripped originals are retained for offset bookkeeping, but the
+  // table source we ship downstream is rebuilt from the stripped lines
+  // so `render_table.ts:parseTable` doesn't see stray `>` glyphs in the
+  // first cell.
+  const scanLines = lines.map(l => l.replace(BLOCKQUOTE_PREFIX_RE, ''))
   let k = 0
   while (k < lines.length - 1) {
     if (inCode[k] || inCode[k + 1]) { k++; continue }
-    if (!lines[k].includes('|') || !TABLE_SEP_RE.test(lines[k + 1])) { k++; continue }
-    const headerPipes = (lines[k].match(/\|/g) || []).length
-    const minPipes = Math.max(2, headerPipes - 1)
+    if (!scanLines[k].includes('|') || !TABLE_SEP_RE.test(scanLines[k + 1])) { k++; continue }
+    const headerPipes = (scanLines[k].match(/\|/g) || []).length
+    // Trust render_table.ts:parseTable's existing right-pad logic
+    // (lines 109-110: `while (r.length < w) r.push('')`) to fill short
+    // rows. Just require enough pipes for at least one cell boundary.
+    const minPipes = Math.max(1, headerPipes - 2)
     let j = k + 2
-    while (j < lines.length && lines[j].trim() !== '' && !inCode[j]) {
-      const rowPipes = (lines[j].match(/\|/g) || []).length
+    while (j < lines.length && scanLines[j].trim() !== '' && !inCode[j]) {
+      const rowPipes = (scanLines[j].match(/\|/g) || []).length
       if (rowPipes < minPipes) break
       j++
     }
-    if (j > k + 2) {
+    // Allow single-row tables (header + separator, no data rows). The
+    // separator line alone is enough evidence this is a table — emit it
+    // and let render_table handle the empty-rows case.
+    if (j > k + 1) {
       const start = lineOffsets[k]
       const end = lineOffsets[j - 1] + lines[j - 1].length
-      const mdSource = lines.slice(k, j).join('\n')
+      const mdSource = scanLines.slice(k, j).join('\n')
       ranges.push({
         start, end, kind: 'table',
         payload: { mdSource },
@@ -148,6 +165,12 @@ export function parseElements(text: string): Element[] {
       k = j
       continue
     }
+    // Near-miss diagnostic: header + separator matched but the data-row
+    // loop bailed before producing any rows AND we're not emitting as a
+    // single-row table. With `j > k + 1` above this branch is currently
+    // unreachable, but logged here as a tripwire for future regressions
+    // that tighten the emit condition.
+    console.error(`[parse_elements] table near-miss at line ${k}: header+separator matched but no emit (j=${j}, k+1=${k + 1})`)
     k++
   }
 
