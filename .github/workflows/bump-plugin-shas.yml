@@ -24,13 +24,13 @@ name: Bump Plugin SHAs
 
 on:
   schedule:
-    - cron: '23 7 * * *'  # Daily 07:23 UTC
+    - cron: '23 7 * * 1'  # Weekly Monday 07:23 UTC (fork preference; upstream runs daily)
   workflow_dispatch:
     inputs:
       max_bumps:
         description: Cap on plugins bumped this run
         required: false
-        default: '130'
+        default: '20'
 
 permissions:
   contents: write
@@ -56,7 +56,7 @@ jobs:
         id: bump
         with:
           marketplace-path: .claude-plugin/marketplace.json
-          max-bumps: ${{ inputs.max_bumps || '130' }}
+          max-bumps: ${{ inputs.max_bumps || '20' }}
           claude-cli-version: latest
 
       # `bump/plugin-shas` is the action's default `pr-branch`. The scan diffs
