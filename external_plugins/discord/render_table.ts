@@ -23,6 +23,7 @@ import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import satori from 'satori'
 import { Resvg } from '@resvg/resvg-js'
+import { displayWidth } from './text_width'
 
 const FONTS_DIR = join(dirname(fileURLToPath(import.meta.url)), 'fonts')
 
@@ -77,12 +78,39 @@ async function loadEmoji(segment: string): Promise<string> {
 const FONT_REG = readFileSync(join(FONTS_DIR, 'DejaVuSans.ttf'))
 const FONT_BOLD = readFileSync(join(FONTS_DIR, 'DejaVuSans-Bold.ttf'))
 const FONT_MONO = readFileSync(join(FONTS_DIR, 'DejaVuSansMono.ttf'))
+// CJK face (2026-08-31). None of the DejaVu faces carry Han/Kana/
+// Hangul glyphs, so every CJK codepoint rendered as tofu (□) — the
+// `loadAdditionalAsset` hook only answers `code === 'emoji'`, so
+// satori's missing-glyph path had nothing to fall back to.
+const FONT_CJK = readFileSync(join(FONTS_DIR, 'NotoSansSC-Regular.otf'))
 
+// Two rules make the CJK fallback actually fire, and both are load-bearing:
+//
+//   1. The CJK face must be registered under its OWN family name.
+//      Adding it as a second `'DejaVu Sans'` entry does NOT chain —
+//      satori resolves a family to the first matching registration and
+//      keeps emitting tofu for glyphs that entry lacks. The fallback
+//      lives in the CSS `fontFamily` stack (see buildTree), not in the
+//      font list.
+//   2. It must be registered at weight 700 as well as 400. Header cells
+//      (`fontWeight: 600`) and `**bold**` spans (`fontWeight: 700`) ask
+//      for a bold face; with only a 400 registration satori drops back
+//      to DejaVu Bold for those runs and bold CJK renders as tofu even
+//      though regular CJK works. We reuse the Regular bytes rather than
+//      vendoring NotoSansSC-Bold (+8 MB) — satori synthesizes the
+//      weight, which is fine at 14 px.
 const SATORI_FONTS = [
   { name: 'DejaVu Sans', data: FONT_REG, weight: 400 as const, style: 'normal' as const },
   { name: 'DejaVu Sans', data: FONT_BOLD, weight: 700 as const, style: 'normal' as const },
   { name: 'DejaVu Sans Mono', data: FONT_MONO, weight: 400 as const, style: 'normal' as const },
+  { name: 'Noto Sans SC', data: FONT_CJK, weight: 400 as const, style: 'normal' as const },
+  { name: 'Noto Sans SC', data: FONT_CJK, weight: 700 as const, style: 'normal' as const },
 ]
+
+// Fallback stack used for every text node in the table. DejaVu first
+// (it owns Latin/Greek/Cyrillic/symbols and matches the pre-existing
+// look), Noto Sans SC second for anything DejaVu can't draw.
+const FONT_STACK = 'DejaVu Sans, Noto Sans SC'
 
 type VNode = { type: string; props: { style?: any; children?: any } }
 type Child = VNode | string
@@ -126,7 +154,7 @@ function inlineMd(s: string): Child[] {
       if (end > 0) {
         flush()
         out.push(h('span', {
-          fontFamily: 'DejaVu Sans Mono',
+          fontFamily: 'DejaVu Sans Mono, Noto Sans SC',
           background: '#2c2c2c',
           padding: '1px 4px',
           borderRadius: 3,
@@ -162,8 +190,10 @@ function inlineMd(s: string): Child[] {
   return out
 }
 
+// Column budget is in monospace cells, so CJK counts double — see
+// text_width.ts. `.length` here undersized every CJK column by ~2x.
 function visibleLen(s: string): number {
-  return s.replace(/\*\*?|`/g, '').length
+  return displayWidth(s.replace(/\*\*?|`/g, ''))
 }
 
 // Approximates satori's word-wrap behavior: greedily fits words into a
@@ -223,7 +253,7 @@ export function countWrappedLines(cell: string, colWidth: number): number {
   if (wordsRaw.length === 0) return 1
   const wordsVirtual = wordsRaw.map(w => {
     const codeBackticks = (w.match(/`/g) || []).length
-    const visible = w.replace(/\*\*?|`/g, '').length
+    const visible = displayWidth(w.replace(/\*\*?|`/g, ''))
     const hasBold = w.includes('**')
     const len = visible + codeBackticks
     return Math.ceil(hasBold ? len * 1.1 : len)
@@ -351,7 +381,7 @@ function buildTree(
     flexDirection: 'column',
     background: '#181818',
     border: '1px solid #444',
-    fontFamily: 'DejaVu Sans',
+    fontFamily: FONT_STACK,
     width: widthPx,
   }, [rowNode(header, true), ...rows.map((r, i) => rowNode(r, false, i % 2 === 1))])
 

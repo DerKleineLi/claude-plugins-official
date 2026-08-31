@@ -202,3 +202,81 @@ describe('renderMarkdownTableToPng() — regression on post_a_plus_g_table.md', 
     expect(height).toBeLessThanOrEqual(214)
   })
 })
+
+// --- CJK rendering (2026-08-31) ---
+//
+// Two independent bugs, both fixed here:
+//   1. No CJK face was vendored, so every Han/Kana glyph came out as
+//      tofu (□) — satori fell back to DejaVu's .notdef.
+//   2. `visibleLen` measured code units, so CJK columns got half the
+//      px budget they needed and their cells wrapped.
+describe('renderMarkdownTableToPng() — CJK', () => {
+  const cjkTable = (cell: string) =>
+    ['| 项目 | Item |', '| --- | --- |', `| ${cell} | latin |`].join('\n')
+
+  test('distinct Han glyphs produce distinct pixels (tofu detector)', async () => {
+    // The load-bearing assertion for the font fix. With no CJK face
+    // registered, both cells render as the *same* .notdef box, so the
+    // two PNGs come out byte-identical. Once Noto Sans SC is in the
+    // fallback stack the glyphs differ and so do the bytes.
+    const a = await renderMarkdownTableToPng(cjkTable('一一'))
+    const b = await renderMarkdownTableToPng(cjkTable('龘龘'))
+    expect(a).not.toBeNull()
+    expect(b).not.toBeNull()
+    // Same char count → same canvas, so a byte diff is a glyph diff.
+    expect(pngDims(a as Buffer)).toEqual(pngDims(b as Buffer))
+    expect((a as Buffer).equals(b as Buffer)).toBe(false)
+  })
+
+  test('control: identical text renders identically', async () => {
+    // Guards the detector above against false positives from any
+    // nondeterminism in the satori/resvg pipeline.
+    const a = await renderMarkdownTableToPng(cjkTable('一一'))
+    const b = await renderMarkdownTableToPng(cjkTable('一一'))
+    expect((a as Buffer).equals(b as Buffer)).toBe(true)
+  })
+
+  test('bold CJK renders as glyphs, not tofu', async () => {
+    // Header cells use fontWeight 600 and `**…**` spans 700. With the
+    // CJK face registered only at weight 400, satori resolves those
+    // runs to DejaVu Bold and bold CJK regresses to tofu even though
+    // regular CJK works — hence the two weight entries in SATORI_FONTS.
+    const bold = (c: string) =>
+      ['| 项目 | Item |', '| --- | --- |', `| **${c}** | latin |`].join('\n')
+    const a = await renderMarkdownTableToPng(bold('一一'))
+    const b = await renderMarkdownTableToPng(bold('龘龘'))
+    expect((a as Buffer).equals(b as Buffer)).toBe(false)
+  })
+
+  test('a CJK column is budgeted ~2x a same-count Latin column', async () => {
+    // 6 Han chars must claim 12 char-cells of width, not 6, so the
+    // CJK canvas is 6 * CHAR_PX = 45 px wider than the same table
+    // with a 6-char Latin cell. Both cells sit above the width-6
+    // floor in computeColWidths, so the floor doesn't absorb the
+    // delta.
+    const wide = await renderMarkdownTableToPng(cjkTable('会议注册费用'))
+    const narrow = await renderMarkdownTableToPng(cjkTable('abcdef'))
+    const dw = pngDims(wide as Buffer).width
+    const dn = pngDims(narrow as Buffer).width
+    expect(dw - dn).toBeGreaterThanOrEqual(40)
+    expect(dw - dn).toBeLessThanOrEqual(50)
+  })
+
+  test('mixed CJK/Latin table renders without a wrapped CJK cell', async () => {
+    // Regression for the live repro (a Chinese reimbursement table).
+    // Every cell fits on one line, so the canvas must stay at the
+    // 3-row single-line height — a cramped CJK column would wrap and
+    // push it taller.
+    const md = [
+      '| 项目 | Item (Latin) | 金额 |',
+      '| --- | --- | --- |',
+      '| 会议注册费 | ECCV registration | 1250 |',
+      '| **住宿费用** | **Hotel** | 890 |',
+    ].join('\n')
+    const png = await renderMarkdownTableToPng(md)
+    expect(png).not.toBeNull()
+    const { height } = pngDims(png as Buffer)
+    // 3 rows x (14px line * 1.4 + 2*8 padding + 1 border) ~= 113 px.
+    expect(height).toBeLessThanOrEqual(125)
+  })
+})

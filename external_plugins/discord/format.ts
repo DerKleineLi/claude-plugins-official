@@ -27,6 +27,7 @@ import { AttachmentBuilder } from 'discord.js'
 import { parseElements } from './parse_elements'
 import { renderMarkdownTableToPng } from './render_table'
 import { renderFormulaToPng } from './render_formula'
+import { displayWidth, padEndWidth } from './text_width'
 
 export const MAX_CHUNK_LIMIT = 2000
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
@@ -56,9 +57,11 @@ function parseTableRow(line: string): string[] {
 //     preserved in their original position; data rows are still
 //     left-padded (we don't honor `---:` right-alignment in monospace —
 //     the colon is a hint to readers, not enforced).
-//   - `.length` counts UTF-16 code units, not display columns. CJK and
-//     emoji that occupy 2 display cells will visually misalign by one
-//     cell per occurrence. Documented as a known caveat in CLAUDE_README.
+//   - Widths are display columns, not UTF-16 code units: East-Asian
+//     Wide/Fullwidth codepoints count as 2 (see text_width.ts). Padding
+//     with `.length` used to misalign a CJK table by one cell per
+//     ideograph in a monospace viewer. Emoji-presentation symbols
+//     (`✅`, `❌`, …) are Wide under Unicode 9+ and count 2 as well.
 //   - Mismatched column counts: the row with the most columns sets the
 //     count; shorter rows are padded with empty trailing cells.
 export function normalizeTableWidths(tableBlock: string): string {
@@ -77,7 +80,7 @@ export function normalizeTableWidths(tableBlock: string): string {
   for (let r = 0; r < rows.length; r++) {
     if (r === 1) continue // separator handled separately
     for (let c = 0; c < numCols; c++) {
-      const len = rows[r][c].length
+      const len = displayWidth(rows[r][c])
       if (len > colWidths[c]) colWidths[c] = len
     }
   }
@@ -97,7 +100,7 @@ export function normalizeTableWidths(tableBlock: string): string {
   const out: string[] = []
   for (let r = 0; r < rows.length; r++) {
     const cells = r === 1 ? sepCells : rows[r]
-    const padded = cells.map((cell, c) => cell.padEnd(colWidths[c]))
+    const padded = cells.map((cell, c) => padEndWidth(cell, colWidths[c]))
     out.push('| ' + padded.join(' | ') + ' |')
   }
   return out.join('\n')

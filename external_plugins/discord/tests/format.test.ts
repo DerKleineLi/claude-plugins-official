@@ -9,6 +9,7 @@ import {
   normalizeTableWidths,
   getOpenFenceAtEnd,
 } from '../format'
+import { displayWidth } from '../text_width'
 
 describe('chunk()', () => {
   test('passthrough for short text', () => {
@@ -412,6 +413,46 @@ describe('normalizeTableWidths()', () => {
     expect(new Set(lines.map(l => l.length)).size).toBe(1)
     // The padded short row still has 3 cell separators.
     expect(lines[2].split('|').length).toBe(5) // ['', cell1, cell2, cell3, '']
+  })
+
+  // --- CJK alignment (2026-08-31) ---
+  //
+  // Padding used `.padEnd`, which counts UTF-16 code units, so a Han
+  // ideograph (1 unit, 2 monospace cells) left the `table-N.md`
+  // fallback attachment short by one cell per ideograph. Alignment is
+  // now asserted on display width; raw `.length` is *expected* to
+  // differ line to line.
+  test('CJK rows align by display width, not code-unit length', () => {
+    const t = [
+      '| 项目 | Item (Latin) | 金额 |',
+      '| --- | --- | --- |',
+      '| 会议注册费 | ECCV registration | €1,250.00 |',
+      '| **住宿费用** | **Hotel** | €890.50 |',
+      '| Latin only | pure ascii control | €99.99 |',
+    ].join('\n')
+    const lines = normalizeTableWidths(t).split('\n')
+    expect(lines.length).toBe(5)
+    expect(new Set(lines.map(displayWidth)).size).toBe(1)
+    // Sanity: this table really does mix widths — a `.length`-based
+    // pad would have produced ragged lines here.
+    expect(new Set(lines.map(l => l.length)).size).toBeGreaterThan(1)
+  })
+
+  test('a CJK cell sets its column width in display cells', () => {
+    // `金额` is 2 chars but 4 cells, so the column must be ≥ 4 wide
+    // (the min-3 separator floor must not win).
+    const t = `| 金额 | b |\n| --- | --- |\n| 1 | 2 |`
+    const lines = normalizeTableWidths(t).split('\n')
+    expect(lines[1]).toMatch(/^\| -{4} \| -{3} \|$/)
+    expect(new Set(lines.map(displayWidth)).size).toBe(1)
+  })
+
+  test('pure-ASCII tables are byte-identical to the pre-CJK behaviour', () => {
+    // The width change must be a no-op for every existing Latin table.
+    const t = `| a | b | c |\n| --- | --- | --- |\n| 1 | 22 | 333 |`
+    expect(normalizeTableWidths(t)).toBe(
+      '| a   | b   | c   |\n| --- | --- | --- |\n| 1   | 22  | 333 |',
+    )
   })
 })
 
