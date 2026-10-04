@@ -36,7 +36,7 @@ This unification (bare MCP server + `--plugin-dir`, no marketplace) was settled 
   2. `buildReplyMessages` (now async) emits one `OutboundMessage` per element. Prose runs through the fence-aware chunker (case 1+2 above). Each non-prose element gets its own attachment-only message (`{content: '', files: [...]}`) immediately following its prose context — Discord renders this as a separate timeline entry that the inline-preview / lightbox UI handles.
 
   **What ships per element:**
-  - **Pipe-tables** → `table-N.png` (satori → SVG → resvg-js, dark theme, adaptive column widths) **+** `table-N.md` (column-normalized via `normalizeTableWidths` so the source is also pretty). PNG is the always-visible artifact; `.md` is searchable/copyable.
+  - **Pipe-tables** → ~~`table-N.png` + `table-N.md`~~ **since 2026-10-04: `table-N.md` only** — see the 2026-10-04 entry below. (Originally: PNG via satori → SVG → resvg-js as the always-visible artifact, `.md` as the searchable/copyable source.)
   - **Display formulas** (`$$…$$`, `\[…\]`, `\begin{equation|equation*|align|align*|aligned|gather|gather*|multline|multline*}…\end{…}`) → `formula-N.png` (mathjax-full → SVG → resvg-js; `currentColor` rewritten to white; dark `#2c2f33` background) **+** `formula-N.tex` (raw source). Inline `$…$` math stays inside prose by design.
   - **Fenced code blocks with a known lang tag** → single `code-N.<ext>` file (`lang_extensions.ts` maps highlight.js v10.6.0 lang IDs + common aliases to canonical extensions). Discord shows it with proper syntax highlighting in the preview pane. The fence markers are stripped — the file holds only the inner source.
   - **Fenced code blocks with empty or unknown lang** → `code-N.txt` (2026-05-11 policy change, replaces the original "stay inline" behavior). Discord renders `.txt` in the file-preview pane with monospace, no syntax highlight, but searchable / scrollable / unbounded by the 2000-char message limit. The right shape for commit lists, log excerpts, untagged code.
@@ -103,6 +103,22 @@ This unification (bare MCP server + `--plugin-dir`, no marketplace) was settled 
 
   **Status — closed 2026-09-01.** Live-verified by the user after a `clive` restart (Chinese table rendered correctly in Discord) and pushed; `origin/local/main` contains this at `3ffec51`. Nothing is half-finished and no branch is outstanding. If you pick this thread up again, the three follow-ups are the Known-limitations entries directly below — **Hangul** (font-only, `NotoSansKR-Regular.otf` ~4.4 MB, register at 400 + 700 as `'Noto Sans KR'`, append to `FONT_STACK`), **bold CJK outlines** (`NotoSansSC-Bold.otf` +8.1 MB, swap it into the weight-700 slot of `SATORI_FONTS`), and the pre-existing **`CHAR_PX` digit under-budget**, which is not CJK-specific and should be treated as its own piece of work. All three were deferred on cost, not difficulty; none is blocked. Tests for this area live in `tests/text_width.test.ts` (width table + boundary cases) and the `— CJK` describe block in `tests/render_table.test.ts`; the tofu detector there is what fails if the font ever leaves the checkout, so treat a failure in it as "the font is missing", not "the glyphs changed".
 
+- **2026-10-04** — **Tables ship as `.md` only; PNG rendering unwired** (`format.ts`, `server.ts`). The user noticed their Discord client now renders the `table-N.md` attachment's file preview as a real table, which makes the PNG redundant. Live test in the task thread (bot-posted via REST, user's eyes on the result):
+
+  | Shape | Renders as a table? |
+  |---|---|
+  | `.md` file attachment containing a pipe table | **yes** |
+  | pipe table inside a ```` ```md ```` fence in the message body | no (shows source) |
+  | bare pipe table in the message body | no (raw `|` text) |
+
+  So Discord has **not** added native markdown tables to message content (a 2026-10-04 web search found no patch note, changelog entry or docs change; discord-api-docs discussion #4098 is still open) — it is only the file-preview pane that renders markdown. The table branch of `buildReplyMessagesWith` now emits one attachment-only message carrying `table-N.md` (still width-normalized by `normalizeTableWidths`, so the raw view also lines up); an oversized buffer falls back to inline prose. `buildReplyMessagesWith` lost its `renderTable` parameter (signature is now `(text, chunkLimit, renderFormula)`).
+
+  **Mobile:** the Discord mobile app does not show attachment previews at all (neither this `.md` nor `code-N.<ext>` files). The user ruled this out of scope on 2026-10-04 ("mobile has all sorts of problems anyway") — do not keep or re-add the PNG for mobile's sake.
+
+  **`render_table.ts` + `fonts/` are now dead code**, kept only until the user live-verifies the `.md`-only path on desktop. After that, delete `render_table.ts`, `tests/render_table.test.ts`, the vendored fonts (incl. the 8.3 MB Noto Sans SC) and the satori/resvg deps if `render_formula.ts` doesn't need them. The table-PNG Known limitations below (Hangul, bold CJK, `CHAR_PX`, VS emoji) stop mattering at the same point.
+
+  Pitfall hit while testing: a label like `测试 — ```md 代码块` in the *same message* as the real fence opens a fence early and truncates the block. Never put a triple-backtick run in prose that precedes a fence.
+
 - **2026-05-12** — **MessageDelete capture.** New `client.on('messageDelete', …)` and `client.on('messageDeleteBulk', …)` listeners (the bulk listener fans out per-message into the same `handleDelete`) + `handleDelete(msg, opts?)` function. When a user (or admin) deletes a message in an allowlisted channel, the plugin emits a `notifications/claude/channel` with `deleted='true'` (marker attribute), `ts=<delete-detect time>`, and — when discord.js had the message cached — `user`, `user_id`, `original_ts`, plus the last-known body and any cached `attachment_count` / `reply_to_message_id`. Bulk-arrival deletes carry an extra `bulk_delete='true'` attribute.
 
   **Why we do not `msg.fetch()` on partials.** Per Discord docs and discord.js's own partials guide, `MESSAGE_DELETE` carries only `{id, channel_id, optional guild_id}` and the message resource is already gone server-side — `fetch()` will throw. Work with whatever discord.js cached (a fresh delete usually has full data because the bot saw the `messageCreate` seconds earlier); on uncached partials, emit with an empty body and omit `user` / `original_ts`.
@@ -158,6 +174,8 @@ Privileged Gateway Intents in use:
 - **Do not** modify `~/.claude/clive_channels.json` to point at a different path. The plugin path is load-bearing for `--plugin-dir`.
 
 ## Known limitations (deferred)
+
+> The first four entries below concern the **table PNG renderer**, which is unwired since 2026-10-04 (tables ship as `.md` only). They only matter again if that path is re-enabled.
 
 - **Hangul (Korean) still renders as tofu (□) in table PNGs.** The 2026-08-31 CJK fix vendors **Noto Sans SC**, whose SubsetOTF build covers Han + kana but **not** Hangul syllables — so Chinese and Japanese render, Korean does not. Verified 2026-08-31: `한국어` came out as three boxes in the same PNG where `会议注册费` and `ひらがな・カタカナ` rendered correctly. The width path is already correct for Hangul (`text_width.ts` counts U+AC00–U+D7A3 as 2 cells), so closing this is font-only: add `Sans/SubsetOTF/KR/NotoSansKR-Regular.otf` (~4.4 MB) to `fonts/`, register it at weights 400 + 700 under the name `'Noto Sans KR'`, and append it to `FONT_STACK`. Deferred purely on checkout size — nobody has needed Korean yet.
 

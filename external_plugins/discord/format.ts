@@ -8,24 +8,24 @@
 //      parser ensures fenced code blocks are claimed first (so an
 //      inner table or `$$…$$` doesn't escape).
 //   2. Each non-prose element renders to a separate Discord message
-//      that carries only file attachments (PNG + source) — Discord's
-//      inline preview pane shows them with syntax highlighting for
-//      .md / .tex / language-extension files, and the PNG is the
-//      always-visible artifact for tables and formulas.
+//      that carries only file attachments. Tables ship as a single
+//      `table-N.md` — Discord's file-preview pane renders a markdown
+//      table as a real table (verified live 2026-10-04; it does NOT
+//      render pipe tables in a message body or inside a ```md fence).
+//      Formulas ship as PNG + .tex; code blocks as one source file.
 //   3. Prose between elements is split with the existing fence-aware
 //      chunker (paragraph > line > word > hard-cut, with synthetic
 //      open/close pairs around fences that straddle a boundary).
 //
-// On per-element render failure: tables fall back to .md-only;
-// formulas fall back to an inline ```tex code block; code blocks with
-// an unrecognized language tag are kept inline by the parser itself.
+// On per-element render failure: formulas fall back to an inline
+// ```tex code block; code blocks with an unrecognized language tag
+// are kept inline by the parser itself.
 //
 // MAX_ATTACHMENT_BYTES (10 MB) is a defensive cap matched to
 // server.ts's cap; an oversized buffer falls back to inline.
 
 import { AttachmentBuilder } from 'discord.js'
 import { parseElements } from './parse_elements'
-import { renderMarkdownTableToPng } from './render_table'
 import { renderFormulaToPng } from './render_formula'
 import { displayWidth, padEndWidth } from './text_width'
 
@@ -293,7 +293,6 @@ function attachmentFromBuffer(buf: Buffer, name: string): AttachmentBuilder | nu
 export async function buildReplyMessagesWith(
   text: string,
   chunkLimit: number,
-  renderTable: (md: string) => Promise<Buffer | null>,
   renderFormula: (tex: string) => Promise<Buffer>,
 ): Promise<OutboundMessage[]> {
   const elements = parseElements(text)
@@ -315,16 +314,10 @@ export async function buildReplyMessagesWith(
     }
     if (el.kind === 'table') {
       tableIdx++
-      const png = await tryRender(() => renderTable(el.mdSource))
-      const files: AttachmentBuilder[] = []
-      if (png) {
-        const a = attachmentFromBuffer(png, `table-${tableIdx}.png`)
-        if (a) files.push(a)
-      }
       const mdBuf = Buffer.from(normalizeTableWidths(el.mdSource), 'utf8')
-      const mdAtt = attachmentFromBuffer(mdBuf, `table-${tableIdx}.md`)
-      if (mdAtt) files.push(mdAtt)
-      if (files.length > 0) out.push({ content: '', files })
+      const att = attachmentFromBuffer(mdBuf, `table-${tableIdx}.md`)
+      if (att) out.push({ content: '', files: [att] })
+      else pushProse(el.mdSource)
       continue
     }
     if (el.kind === 'formula') {
@@ -374,7 +367,6 @@ export async function buildReplyMessages(
   return buildReplyMessagesWith(
     text,
     chunkLimit,
-    renderMarkdownTableToPng,
     renderFormulaToPng,
   )
 }

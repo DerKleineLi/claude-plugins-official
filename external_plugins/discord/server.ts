@@ -553,7 +553,7 @@ const mcp = new Server(
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
-      'Reply text is auto-elementized: markdown pipe-tables ship as PNG + .md, display formulas as PNG + .tex, and fenced code blocks as a single file attachment (recognized lang → code-N.<ext> with syntax highlighting; empty or unknown lang → code-N.txt). To force a fenced code block to stay inline in the message body instead of becoming a file, tag it with ```inline (case-insensitive). Use ```inline for short snippets where the inline render reads better than a separate file preview.',
+      'Reply text is auto-elementized: markdown pipe-tables ship as a table-N.md attachment (the Discord file preview renders it as a table), display formulas as PNG + .tex, and fenced code blocks as a single file attachment (recognized lang → code-N.<ext> with syntax highlighting; empty or unknown lang → code-N.txt). To force a fenced code block to stay inline in the message body instead of becoming a file, tag it with ```inline (case-insensitive). Use ```inline for short snippets where the inline render reads better than a separate file preview.',
       '',
       "fetch_messages pulls real Discord history. Discord's search API isn't available to bots — if the user asks you to find an old message, fetch more history or ask them roughly when it was.",
       '',
@@ -920,8 +920,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const replyMode = access.replyToMode ?? 'first'
         // buildReplyMessages walks the reply text into prose/table/formula/code
         // elements; non-prose elements ship as their own attachment-only
-        // message (PNG + source for tables/formulas, single source file for
-        // code blocks with a known lang tag). Prose runs through the
+        // message (.md for tables, PNG + source for formulas, single source
+        // file for code blocks with a known lang tag). Prose runs through the
         // fence-aware chunker.
         const messages = await buildReplyMessages(text, limit)
         const sentIds: string[] = []
@@ -934,8 +934,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
             // User-supplied `files` (param) attach only to the first outbound
-            // message. Per-message `m.files` (e.g. the attachment-fallback
-            // table.md buffer) attach to whichever message owns them.
+            // message. Per-message `m.files` (e.g. a table-N.md buffer)
+            // attach to whichever message owns them.
             const messageFiles = m.files ?? []
             const finalFiles = i === 0 ? [...files, ...messageFiles] : messageFiles
             const sent = await ch.send({

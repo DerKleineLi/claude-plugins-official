@@ -463,9 +463,7 @@ describe('normalizeTableWidths()', () => {
 // expensive and pull in heavy I/O. End-to-end with the real renderers is
 // covered by smoke tests in tests/_demo_render.ts and live-verify.
 
-const stubTablePng = async (_md: string): Promise<Buffer> => Buffer.from('PNG-TABLE-STUB')
 const stubFormulaPng = async (_tex: string): Promise<Buffer> => Buffer.from('PNG-FORMULA-STUB')
-const failingTablePng = async (_md: string): Promise<Buffer> => { throw new Error('synthetic table render failure') }
 const failingFormulaPng = async (_tex: string): Promise<Buffer> => { throw new Error('synthetic formula render failure') }
 
 const fileNames = (m: { files?: { name?: string | null }[] }): string[] =>
@@ -473,7 +471,7 @@ const fileNames = (m: { files?: { name?: string | null }[] }): string[] =>
 
 describe('buildReplyMessages() — plain prose', () => {
   test('plain text passes through as a single message with no files', async () => {
-    const out = await buildReplyMessagesWith('hello world', 2000, stubTablePng, stubFormulaPng)
+    const out = await buildReplyMessagesWith('hello world', 2000, stubFormulaPng)
     expect(out.length).toBe(1)
     expect(out[0].content).toBe('hello world')
     expect(out[0].files).toBeUndefined()
@@ -481,7 +479,7 @@ describe('buildReplyMessages() — plain prose', () => {
 
   test('long prose is paragraph-chunked', async () => {
     const t = ('paragraph text. '.repeat(50) + '\n\n').repeat(10)
-    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    const out = await buildReplyMessagesWith(t, 2000, stubFormulaPng)
     expect(out.length).toBeGreaterThan(1)
     for (const m of out) {
       expect(m.content.length).toBeLessThanOrEqual(2000)
@@ -491,21 +489,21 @@ describe('buildReplyMessages() — plain prose', () => {
 })
 
 describe('buildReplyMessages() — tables', () => {
-  test('single table → 1 file message with PNG + .md', async () => {
+  test('single table → 1 file message with .md only (no PNG)', async () => {
     const t = `| a | b |\n|---|---|\n| 1 | 2 |`
-    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    const out = await buildReplyMessagesWith(t, 2000, stubFormulaPng)
     expect(out.length).toBe(1)
     expect(out[0].content).toBe('')
-    expect(fileNames(out[0])).toEqual(['table-1.png', 'table-1.md'])
+    expect(fileNames(out[0])).toEqual(['table-1.md'])
   })
 
   test('table with surrounding prose → 3 messages (prose + file + prose)', async () => {
     const t = 'before\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nafter'
-    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    const out = await buildReplyMessagesWith(t, 2000, stubFormulaPng)
     expect(out.length).toBe(3)
     expect(out[0].content).toBe('before')
     expect(out[1].content).toBe('')
-    expect(fileNames(out[1])).toEqual(['table-1.png', 'table-1.md'])
+    expect(fileNames(out[1])).toEqual(['table-1.md'])
     expect(out[2].content).toBe('after')
   })
 
@@ -525,29 +523,29 @@ describe('buildReplyMessages() — tables', () => {
       '',
       'C.',
     ].join('\n')
-    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    const out = await buildReplyMessagesWith(t, 2000, stubFormulaPng)
     const seq = out.map(m => (m.files && m.files.length ? `files:${fileNames(m).join(',')}` : `prose:${m.content}`))
     expect(seq).toEqual([
       'prose:A.',
-      'files:table-1.png,table-1.md',
+      'files:table-1.md',
       'prose:between',
-      'files:table-2.png,table-2.md',
+      'files:table-2.md',
       'prose:C.',
     ])
   })
 
-  test('table PNG render failure → ships .md only (split still happens)', async () => {
-    const t = '| a | b |\n|---|---|\n| 1 | 2 |'
-    const out = await buildReplyMessagesWith(t, 2000, failingTablePng, stubFormulaPng)
-    expect(out.length).toBe(1)
-    expect(fileNames(out[0])).toEqual(['table-1.md'])
+  test('table .md keeps CJK column alignment (display-width padding)', async () => {
+    const t = '| 项目 | n |\n|---|---|\n| 会议 | 1 |\n| ab | 22 |'
+    const out = await buildReplyMessagesWith(t, 2000, stubFormulaPng)
+    const md = (out[0].files![0] as any).attachment.toString('utf8')
+    expect(md).toBe(normalizeTableWidths(t))
   })
 })
 
 describe('buildReplyMessages() — formulas', () => {
   test('display formula on its own line → 1 file message with PNG + .tex', async () => {
     const t = '$$E = mc^2$$'
-    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    const out = await buildReplyMessagesWith(t, 2000, stubFormulaPng)
     expect(out.length).toBe(1)
     expect(out[0].content).toBe('')
     expect(fileNames(out[0])).toEqual(['formula-1.png', 'formula-1.tex'])
@@ -555,7 +553,7 @@ describe('buildReplyMessages() — formulas', () => {
 
   test('formula PNG render failure → falls back to inline ```tex code-block', async () => {
     const t = 'before\n\n$$E = mc^2$$\n\nafter'
-    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, failingFormulaPng)
+    const out = await buildReplyMessagesWith(t, 2000, failingFormulaPng)
     expect(out.length).toBe(3)
     expect(out[0].content).toBe('before')
     expect(out[1].content).toBe('```tex\nE = mc^2\n```')
@@ -565,7 +563,7 @@ describe('buildReplyMessages() — formulas', () => {
 
   test('inline $...$ math stays inside prose', async () => {
     const t = 'the constant $\\pi$ is irrational'
-    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    const out = await buildReplyMessagesWith(t, 2000, stubFormulaPng)
     expect(out.length).toBe(1)
     expect(out[0].content).toBe(t)
     expect(out[0].files).toBeUndefined()
@@ -575,7 +573,7 @@ describe('buildReplyMessages() — formulas', () => {
 describe('buildReplyMessages() — code blocks', () => {
   test('python code-block → 1 file message named code-1.py', async () => {
     const t = '```python\nprint("hi")\n```'
-    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    const out = await buildReplyMessagesWith(t, 2000, stubFormulaPng)
     expect(out.length).toBe(1)
     expect(out[0].content).toBe('')
     expect(fileNames(out[0])).toEqual(['code-1.py'])
@@ -583,13 +581,13 @@ describe('buildReplyMessages() — code blocks', () => {
 
   test('json code-block → code-1.json', async () => {
     const t = '```json\n{"a": 1}\n```'
-    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    const out = await buildReplyMessagesWith(t, 2000, stubFormulaPng)
     expect(fileNames(out[0])).toEqual(['code-1.json'])
   })
 
   test('multiple known-lang code-blocks counter → code-1, code-2', async () => {
     const t = '```py\na = 1\n```\n\n```ts\nlet b = 2\n```'
-    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    const out = await buildReplyMessagesWith(t, 2000, stubFormulaPng)
     const fileMsgs = out.filter(m => m.files && m.files.length > 0)
     expect(fileMsgs.length).toBe(2)
     expect(fileNames(fileMsgs[0])).toEqual(['code-1.py'])
@@ -598,7 +596,7 @@ describe('buildReplyMessages() — code blocks', () => {
 
   test('no-lang code-block becomes code-1.txt file message', async () => {
     const t = '```\nplain\n```'
-    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    const out = await buildReplyMessagesWith(t, 2000, stubFormulaPng)
     expect(out.length).toBe(1)
     expect(out[0].content).toBe('')
     expect(fileNames(out[0])).toEqual(['code-1.txt'])
@@ -606,7 +604,7 @@ describe('buildReplyMessages() — code blocks', () => {
 
   test('unknown-lang code-block becomes code-1.txt file message', async () => {
     const t = '```madeuplang\nfoo\n```'
-    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    const out = await buildReplyMessagesWith(t, 2000, stubFormulaPng)
     expect(out.length).toBe(1)
     expect(out[0].content).toBe('')
     expect(fileNames(out[0])).toEqual(['code-1.txt'])
@@ -614,7 +612,7 @@ describe('buildReplyMessages() — code blocks', () => {
 
   test('inline-tagged code-block stays inline in prose', async () => {
     const t = '```inline\nkeep me inline\n```'
-    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    const out = await buildReplyMessagesWith(t, 2000, stubFormulaPng)
     expect(out.length).toBe(1)
     expect(out[0].content).toBe('```inline\nkeep me inline\n```')
     expect(out[0].files).toBeUndefined()
@@ -640,13 +638,13 @@ describe('buildReplyMessages() — mixed', () => {
       'print("hi")',
       '```',
     ].join('\n')
-    const out = await buildReplyMessagesWith(t, 2000, stubTablePng, stubFormulaPng)
+    const out = await buildReplyMessagesWith(t, 2000, stubFormulaPng)
     const seq = out.map(m =>
       m.files && m.files.length ? `files:${fileNames(m).join(',')}` : `prose:${m.content}`,
     )
     expect(seq).toEqual([
       'prose:A.',
-      'files:table-1.png,table-1.md',
+      'files:table-1.md',
       'prose:B.',
       'files:formula-1.png,formula-1.tex',
       'prose:C.',
