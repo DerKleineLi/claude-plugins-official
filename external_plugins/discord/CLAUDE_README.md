@@ -115,7 +115,7 @@ This unification (bare MCP server + `--plugin-dir`, no marketplace) was settled 
 
   **Mobile:** the Discord mobile app does not show attachment previews at all (neither this `.md` nor `code-N.<ext>` files). The user ruled this out of scope on 2026-10-04 ("mobile has all sorts of problems anyway") — do not keep or re-add the PNG for mobile's sake.
 
-  **`render_table.ts` + `fonts/` are now dead code**, kept only until the user live-verifies the `.md`-only path on desktop. After that, delete `render_table.ts`, `tests/render_table.test.ts`, the vendored fonts (incl. the 8.3 MB Noto Sans SC) and the satori/resvg deps if `render_formula.ts` doesn't need them. The table-PNG Known limitations below (Hangul, bold CJK, `CHAR_PX`, VS emoji) stop mattering at the same point.
+  **`render_table.ts` + `fonts/` are unwired but kept on purpose as a backup** — the user said so on 2026-10-05 after live-verifying the `.md`-only path on desktop ("keep the unused code as a spare"). **Do not delete** `render_table.ts`, `tests/render_table.test.ts`, `tests/fixtures/`, the vendored fonts, or the `satori` dep. Re-enabling is a small re-wire: add a `renderTable` param back to `buildReplyMessagesWith`, pass `renderMarkdownTableToPng` from `buildReplyMessages`, and attach the PNG before the `.md` in the table branch (see commit `d1985ab` for the exact diff to reverse). Its tests still run and pass, so the backup doesn't rot silently. The table-PNG Known limitations below (Hangul, bold CJK, `CHAR_PX`, VS emoji) only matter if it is re-enabled.
 
   Pitfall hit while testing: a label like `测试 — ```md 代码块` in the *same message* as the real fence opens a fence early and truncates the block. Never put a triple-backtick run in prose that precedes a fence.
 
